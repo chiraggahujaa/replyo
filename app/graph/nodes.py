@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 
 from app.graph.state import BookingInfo, ConversationState, Intent, LeadInfo
 from app.llm import get_chat_model
+from app.rag import retrieve
 
 # --- Business persona (Step 1 stub; RAG over real docs comes in Step 3) ---
 CLINIC_NAME = "BrightSmile Dental"
@@ -49,8 +50,10 @@ class TriageResult(BaseModel):
     intent: Intent = Field(
         description=(
             "Classification of the latest user message. "
-            "new_lead: a prospective patient asking about services/prices for the first time. "
-            "existing_customer: a current patient with a question about their care/account. "
+            "new_lead: a prospective patient expressing interest in becoming a patient or wanting treatment. "
+            "question: a factual question about the clinic answerable from its documents "
+            "(prices, services offered, insurance/policies, opening hours, location). "
+            "existing_customer: a current patient asking about THEIR OWN records, appointment, or account. "
             "booking_request: wants to schedule, reschedule, or cancel an appointment. "
             "complaint: unhappy, frustrated, or reporting a problem. "
             "spam: irrelevant, promotional, or nonsensical."
@@ -269,3 +272,73 @@ def handle_spam(state: ConversationState) -> dict:
         temperature=0.2,
     )
     return {"messages": [ai]}
+
+
+# ---- RAG: answer factual questions from the clinic's documents (Step 3) ----
+
+RETRIEVAL_K = 4
+# Cosine distance cut-off (lower = more similar). This is a coarse PRE-FILTER, not
+# the main safety net: it only drops clearly-unrelated queries (car engine ~0.80,
+# weather ~0.85) so we don't waste an LLM call on them. The real anti-hallucination
+# guard is the grounding prompt below, which declines when the specific answer
+# isn't in the retrieved text.
+# Tuned against the actual data (scripts/smoke_chat.py + the distance probe): real
+# in-domain questions land ~0.43–0.73 (e.g. "where are you located?" ≈ 0.73), so
+# anything below ~0.5 caused false refusals. 0.76 clears every legit question while
+# still filtering the 0.80+ off-topic ones.
+MAX_DISTANCE = 0.76
+
+REFUSAL = (
+    "I'm not certain about that from the information I have on hand, and I don't want to "
+    "give you anything inaccurate. Let me have a team member confirm and get back to you — "
+    "what's the best number or email to reach you on?"
+)
+
+
+def _latest_user_text(state: ConversationState) -> str:
+    for msg in reversed(state["messages"]):
+        if getattr(msg, "type", None) == "human":
+            return msg.content
+    return ""
+
+
+def answer_from_docs(state: ConversationState) -> dict:
+    """Retrieve relevant chunks and answer ONLY from them, with citations.
+
+    Two guardrails against hallucination:
+      1. Relevance gate — if nothing retrieved is within MAX_DISTANCE, we refuse
+         outright and never even ask the model to answer.
+      2. Grounding prompt — the model is told to answer strictly from the supplied
+         context and to say it doesn't know rather than invent prices/policies.
+    """
+    query = _latest_user_text(state)
+    hits = retrieve(query, k=RETRIEVAL_K)
+    relevant = [(doc, dist) for doc, dist in hits if dist <= MAX_DISTANCE]
+
+    # Guard 1: nothing relevant -> refuse, don't hallucinate.
+    if not relevant:
+        return {"messages": [AIMessage(content=REFUSAL)], "citations": []}
+
+    # Build a numbered context block and the ordered, de-duped source list.
+    sources: list[str] = []
+    context_parts = []
+    for i, (doc, _dist) in enumerate(relevant, start=1):
+        src = doc.metadata.get("source", "unknown")
+        if src not in sources:
+            sources.append(src)
+        context_parts.append(f"[{i}] (source: {src})\n{doc.page_content}")
+    context = "\n\n".join(context_parts)
+
+    # Guard 2: grounding instructions.
+    instructions = (
+        "Answer the patient's question USING ONLY the context below. If the answer is not "
+        "clearly in the context, say you don't have that information on hand and offer to "
+        "have the team follow up — do NOT guess or invent prices, policies, or availability. "
+        "Cite the sources you used inline like [1], [2]. Keep it concise.\n\n"
+        f"Context:\n{context}"
+    )
+    ai = _reply(state, instructions, temperature=0.1)
+
+    # Append a human-friendly Sources footer so it shows in any channel.
+    reply = f"{ai.content}\n\nSources: {', '.join(sources)}"
+    return {"messages": [AIMessage(content=reply)], "citations": sources}

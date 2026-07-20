@@ -25,6 +25,7 @@ Intent = Literal[
     "booking_request",
     "complaint",
     "spam",
+    "question",  # factual question answerable from the clinic's documents (RAG)
 ]
 
 
@@ -75,5 +76,5 @@ class ConversationState(TypedDict, total=False):
     # The approval dashboard that consumes this arrives in Step 6.
     needs_human: bool
 
-    # --- Reserved for later steps ---
-    # citations: list          # RAG source snippets backing an answer (Step 3)
+    # Source filenames backing the last RAG answer (empty when we refused/none found).
+    citations: list[str]

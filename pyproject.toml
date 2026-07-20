@@ -20,6 +20,8 @@ dependencies = [
     # Config
     "pydantic-settings>=2.5",
     "python-dotenv>=1.0",
+    "langchain-postgres>=0.0.17",
+    "langchain-text-splitters>=1.1.2",
 ]
 
 [project.optional-dependencies]

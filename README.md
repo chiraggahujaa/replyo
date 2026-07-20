@@ -7,35 +7,36 @@ humans, and follows up automatically.
 
 Built step by step with **Python + LangGraph + FastAPI + Postgres (Supabase)**.
 
-## What's built (Steps 1–2)
+## What's built (Steps 1–3)
 
-A working end-to-end slice with intent-based routing and lead qualification:
+A working end-to-end slice with intent routing, lead/booking slot-filling, and
+document-grounded answers:
 
 ```
 inbound message ──▶ FastAPI /chat  or  Telegram bot
                         │
                         ▼
       LangGraph:  START ─▶ triage ─┬─ new_lead ─────────▶ qualify ─────────▶ END
+                                    ├─ question ─────────▶ answer_from_docs ▶ END   (RAG + citations)
                                     ├─ existing_customer ▶ respond ──────────▶ END
                                     ├─ booking_request ──▶ handle_booking ───▶ END
                                     ├─ complaint ────────▶ handle_complaint ─▶ END
                                     └─ spam ─────────────▶ handle_spam ──────▶ END
                         │
                         ▼
-        Postgres checkpointer (Supabase)  ← per-conversation memory
+        Postgres checkpointer (Supabase)  +  pgvector (clinic docs)
 ```
 
-- **triage** classifies each message: `new_lead · existing_customer · booking_request · complaint · spam`
-  and a conditional edge routes to exactly one handler.
-- **qualify** progressively collects lead slots — **need · timeline · contact** (+ name, budget) —
-  one question at a time, accumulating them across turns via the checkpointer. Flips
-  `lead_info.qualified = true` once the required slots are filled.
+- **triage** classifies each message into six intents and a conditional edge routes to one handler.
+- **qualify** / **handle_booking** progressively collect slots (need/timeline/contact; name/time/contact)
+  one question at a time via a shared slot-fill engine — neither can confirm until every required slot is filled.
+- **answer_from_docs** (RAG) retrieves the most relevant chunks of the clinic's documents from pgvector
+  and answers **only** from them, appending `Sources:`. Two anti-hallucination guards: a relevance-distance
+  gate (refuse if nothing is close enough) and a strict grounding prompt (never invent prices/policies).
 - **handle_complaint** sets `needs_human = true` (the approval dashboard consuming it lands in Step 6).
-- Every turn is persisted per `thread_id`, so a returning user is picked up where
-  they left off — for free, via the checkpointer.
+- Every turn is persisted per `thread_id`, so a returning user is picked up where they left off.
 
-`/chat` returns `intent`, `reply`, and (for leads) the running `lead_info` + `needs_human` so you
-can watch qualification fill up turn by turn.
+`/chat` returns `intent`, `reply`, `lead_info`, `booking_info`, `citations`, and `needs_human`.
 
 ## Setup
 
@@ -59,6 +60,12 @@ can watch qualification fill up turn by turn.
    ```bash
    uv run python scripts/setup_checkpointer.py
    ```
+
+5. **Ingest the clinic documents into pgvector (one time, re-run after editing `data/`):**
+   ```bash
+   uv run python scripts/ingest_docs.py
+   ```
+   This embeds every `data/*.md` file so the `question` intent can answer from them.
 
 ## Run
 
@@ -87,21 +94,24 @@ app/
   config.py            # env / settings (pydantic-settings)
   llm.py               # ChatOpenAI factory
   graph/
-    state.py           # ConversationState + LeadInfo
-    nodes.py           # triage, qualify, respond, handle_booking/complaint/spam
+    state.py           # ConversationState + LeadInfo + BookingInfo
+    nodes.py           # triage, qualify, answer_from_docs (RAG), respond, handle_*
     build.py           # graph assembly, conditional routing + run_turn helper
+  rag.py               # embeddings + pgvector store + retrieve() helper
   api.py               # FastAPI: /health, /chat
   channels/
-    telegram_bot.py    # Telegram long-polling worker
+    telegram_bot.py    # Telegram long-polling worker (+ /start, /reset)
+data/                  # clinic documents (pricing, services, policies, hours)
 scripts/
   setup_checkpointer.py
+  ingest_docs.py       # chunk + embed data/*.md into pgvector
 ```
 
 ## Roadmap
 
 - ~~**Step 1** — foundation + working vertical slice (triage → respond, Postgres memory)~~ ✅
 - ~~**Step 2** — per-intent routing + lead qualification (need/timeline/contact)~~ ✅
-- **Step 3** — RAG over clinic docs (pgvector) with citations + no-hallucination guard
+- ~~**Step 3** — RAG over clinic docs (pgvector) with citations + no-hallucination guard~~ ✅
 - **Step 4** — appointment booking (Cal.com / Google Calendar) with conflict handling
 - **Step 5** — CRM sync (Airtable / HubSpot free tier)
 - **Step 6** — human-in-the-loop escalation + Next.js approval dashboard

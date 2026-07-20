@@ -44,6 +44,7 @@ class ChatResponse(BaseModel):
     reply: str
     lead_info: dict | None = None
     booking_info: dict | None = None
+    citations: list[str] = []
     needs_human: bool = False
 
 

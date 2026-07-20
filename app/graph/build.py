@@ -18,6 +18,7 @@ from langgraph.graph import END, START, StateGraph
 
 from app.config import settings
 from app.graph.nodes import (
+    answer_from_docs,
     handle_booking,
     handle_complaint,
     handle_spam,
@@ -30,6 +31,7 @@ from app.graph.state import ConversationState
 # Which handler each triage intent routes to.
 INTENT_ROUTES = {
     "new_lead": "qualify",
+    "question": "answer_from_docs",
     "existing_customer": "respond",
     "booking_request": "handle_booking",
     "complaint": "handle_complaint",
@@ -55,6 +57,7 @@ def build_graph(checkpointer):
     builder = StateGraph(ConversationState)
     builder.add_node("triage", triage)
     builder.add_node("qualify", qualify)
+    builder.add_node("answer_from_docs", answer_from_docs)
     builder.add_node("respond", respond)
     builder.add_node("handle_booking", handle_booking)
     builder.add_node("handle_complaint", handle_complaint)
@@ -101,5 +104,6 @@ async def run_turn(graph, thread_id: str, text: str) -> dict:
         "reply": result["messages"][-1].content,
         "lead_info": result.get("lead_info"),
         "booking_info": result.get("booking_info"),
+        "citations": result.get("citations") or [],
         "needs_human": result.get("needs_human", False),
     }
