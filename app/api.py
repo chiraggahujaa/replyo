@@ -42,6 +42,9 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     intent: str | None
     reply: str
+    lead_info: dict | None = None
+    booking_info: dict | None = None
+    needs_human: bool = False
 
 
 @app.get("/health")

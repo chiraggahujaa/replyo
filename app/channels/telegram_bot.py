@@ -17,6 +17,7 @@ import logging
 from telegram import Update
 from telegram.ext import (
     Application,
+    CommandHandler,
     ContextTypes,
     MessageHandler,
     filters,
@@ -30,6 +31,28 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger("replyo.telegram")
+
+
+async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/start — greet. (Telegram sends this automatically on first open.)"""
+    await update.message.reply_text(
+        "👋 Hi! I'm the BrightSmile Dental assistant. Ask about our services, "
+        "book a visit, or tell me what you need. Send /reset anytime to start over."
+    )
+
+
+async def handle_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/reset — wipe this chat's server-side memory so the next message is a clean start.
+
+    Because conversation state lives in Postgres (keyed by telegram:<chat_id>), the
+    only way to truly start fresh in a 1:1 bot chat is to delete that thread.
+    """
+    chat_id = update.effective_chat.id
+    thread_id = f"telegram:{chat_id}"
+    graph = context.bot_data["graph"]
+    await graph.checkpointer.adelete_thread(thread_id)
+    logger.info("reset thread %s", thread_id)
+    await update.message.reply_text("🧹 Conversation reset — we're starting fresh.")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -78,6 +101,8 @@ def main() -> None:
         .post_shutdown(_post_shutdown)
         .build()
     )
+    application.add_handler(CommandHandler("start", handle_start))
+    application.add_handler(CommandHandler("reset", handle_reset))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Replyo Telegram bot starting (long-polling)...")

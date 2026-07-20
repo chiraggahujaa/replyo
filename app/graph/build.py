@@ -17,19 +17,55 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.graph import END, START, StateGraph
 
 from app.config import settings
-from app.graph.nodes import respond, triage
+from app.graph.nodes import (
+    handle_booking,
+    handle_complaint,
+    handle_spam,
+    qualify,
+    respond,
+    triage,
+)
 from app.graph.state import ConversationState
+
+# Which handler each triage intent routes to.
+INTENT_ROUTES = {
+    "new_lead": "qualify",
+    "existing_customer": "respond",
+    "booking_request": "handle_booking",
+    "complaint": "handle_complaint",
+    "spam": "handle_spam",
+}
+
+
+def route_by_intent(state: ConversationState) -> str:
+    """Conditional-edge function: return the triage intent (a key of INTENT_ROUTES).
+
+    LangGraph maps this return value to a node via the INTENT_ROUTES path map
+    passed to add_conditional_edges. Unknown/None falls back to a safe default.
+    """
+    intent = state.get("intent")
+    return intent if intent in INTENT_ROUTES else "existing_customer"
 
 
 def build_graph(checkpointer):
-    """Compile the conversation graph with the given checkpointer."""
+    """Compile the conversation graph with the given checkpointer.
+
+        START -> triage -> (conditional) -> one handler -> END
+    """
     builder = StateGraph(ConversationState)
     builder.add_node("triage", triage)
+    builder.add_node("qualify", qualify)
     builder.add_node("respond", respond)
+    builder.add_node("handle_booking", handle_booking)
+    builder.add_node("handle_complaint", handle_complaint)
+    builder.add_node("handle_spam", handle_spam)
 
     builder.add_edge(START, "triage")
-    builder.add_edge("triage", "respond")
-    builder.add_edge("respond", END)
+    # Fan out from triage to exactly one handler based on the classified intent.
+    builder.add_conditional_edges("triage", route_by_intent, INTENT_ROUTES)
+    # Every handler is terminal for this turn.
+    for handler in set(INTENT_ROUTES.values()):
+        builder.add_edge(handler, END)
 
     return builder.compile(checkpointer=checkpointer)
 
@@ -63,4 +99,7 @@ async def run_turn(graph, thread_id: str, text: str) -> dict:
     return {
         "intent": result.get("intent"),
         "reply": result["messages"][-1].content,
+        "lead_info": result.get("lead_info"),
+        "booking_info": result.get("booking_info"),
+        "needs_human": result.get("needs_human", False),
     }
