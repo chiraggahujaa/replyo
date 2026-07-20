@@ -23,6 +23,16 @@ class Settings(BaseSettings):
     # --- Telegram ---
     telegram_bot_token: str = ""
 
+    # --- Google Calendar (Step 4 booking) ---
+    # Path to the service-account JSON key. Leave blank to use the in-memory
+    # calendar fallback (no external setup; good for local dev/tests).
+    google_service_account_file: str = ""
+    # The calendar to book on — usually the Google account email you shared with
+    # the service account, or a specific calendar id.
+    google_calendar_id: str = ""
+    # IANA timezone for appointment times.
+    clinic_timezone: str = "Asia/Kolkata"
+
     # --- Optional LangSmith tracing ---
     langsmith_tracing: bool = False
     langsmith_api_key: str = ""

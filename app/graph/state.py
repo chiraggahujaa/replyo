@@ -49,14 +49,22 @@ class BookingInfo(TypedDict, total=False):
     """Appointment-request slots, filled progressively by `handle_booking`.
 
     `ready` flips True once name, preferred_time and contact are all present — the
-    handler must not claim a booking is confirmed before then. Real calendar
-    scheduling arrives in Step 4.
+    handler must not claim a booking is confirmed before then. Once ready, the
+    booking service (Step 4) tries to reserve a real calendar slot and updates the
+    scheduling fields below.
     """
 
     name: str | None
     preferred_time: str | None  # requested day/time, e.g. "Saturday 3pm"
     contact: str | None         # phone or email
     ready: bool
+
+    # Scheduling outcome, written by handle_booking via the booking service.
+    status: str                  # collecting | conflict | confirmed
+    confirmed_time: str | None   # human label of the booked slot
+    event_id: str | None         # calendar provider's event id
+    alternatives: list[str]      # human labels offered on a conflict
+    alternatives_iso: list[str]  # same slots as ISO, for resolving the user's pick
 
 
 class ConversationState(TypedDict, total=False):

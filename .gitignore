@@ -11,6 +11,10 @@ venv/
 .env
 .env.*
 !.env.example
+# Google service-account keys (never commit)
+service-account*.json
+*-service-account.json
+credentials*.json
 
 # uv
 uv.lock

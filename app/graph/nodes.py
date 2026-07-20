@@ -20,6 +20,8 @@ from typing import Optional
 from langchain_core.messages import AIMessage, SystemMessage
 from pydantic import BaseModel, Field
 
+from app.booking import format_slot, try_book
+from app.calendar import get_calendar
 from app.graph.state import BookingInfo, ConversationState, Intent, LeadInfo
 from app.llm import get_chat_model
 from app.rag import retrieve
@@ -221,11 +223,13 @@ class BookingExtraction(BaseModel):
 
 
 def handle_booking(state: ConversationState) -> dict:
-    """Booking request: collect name + preferred time + contact before confirming.
+    """Booking request: collect name + time + contact, then reserve a real slot.
 
-    Same slot-filling engine as `qualify`, so it can't claim a slot is confirmed
-    until every required detail (crucially, the name) has been gathered. Real
-    calendar scheduling arrives in Step 4.
+    Phase 1 (collecting): same slot-fill engine as qualify — can't proceed until
+    name + preferred_time + contact are all present.
+    Phase 2 (ready): hand off to the booking service, which parses the time, checks
+    the calendar, and either confirms the slot or offers alternatives on a conflict.
+    On a conflict the user's next message (their pick) re-enters here and re-books.
     """
     booking: BookingInfo = _extract_and_merge(  # type: ignore[assignment]
         state,
@@ -236,20 +240,69 @@ def handle_booking(state: ConversationState) -> dict:
         complete_flag="ready",
         extraction_hint="Extract appointment-booking details from the conversation for a dental clinic.",
     )
-    ai = _slot_fill_reply(
-        state,
-        info=booking,
-        all_slots=ALL_BOOKING_SLOTS,
-        required=REQUIRED_BOOKING_SLOTS,
-        ask_intro=(
-            "This is an appointment booking request. You cannot see the live calendar yet, so you "
-            "are only gathering the request details (real scheduling comes later)."
-        ),
-        done_intro=(
-            "You now have all booking details. Recap the name, requested day/time and contact, and "
-            "say you'll confirm the exact slot shortly. Make clear it's a REQUESTED slot, not yet confirmed."
-        ),
+
+    # Already booked earlier — don't create a duplicate; acknowledge.
+    if booking.get("status") == "confirmed":
+        ai = _reply(
+            state,
+            f"They already have a confirmed appointment for {booking.get('confirmed_time')}. "
+            "Acknowledge warmly; if they want to change it, ask what new time they'd prefer.",
+        )
+        return {"booking_info": booking, "messages": [ai]}
+
+    # Phase 1: still missing a required slot -> keep collecting.
+    if not booking.get("ready"):
+        booking["status"] = "collecting"
+        ai = _slot_fill_reply(
+            state,
+            info=booking,
+            all_slots=ALL_BOOKING_SLOTS,
+            required=REQUIRED_BOOKING_SLOTS,
+            ask_intro="This is an appointment booking request; gather the details needed to book.",
+            done_intro="You now have all booking details.",  # unused: ready path handled below
+        )
+        return {"booking_info": booking, "messages": [ai]}
+
+    # Phase 2: ready -> attempt to reserve a real calendar slot.
+    # Feed the parser the accumulated requested time (not just the latest message,
+    # which may have been the name/contact turn) plus the latest message so it can
+    # also resolve a conflict-pick like "the first option".
+    time_text = (
+        f"Requested time: {booking.get('preferred_time') or 'unspecified'}. "
+        f"Latest message: {_latest_user_text(state)}"
     )
+    result = try_book(booking, get_calendar(), time_text)
+
+    if result["status"] == "confirmed":
+        booking["status"] = "confirmed"
+        booking["confirmed_time"] = format_slot(result["start"])
+        booking["event_id"] = result["event_id"]
+        booking.pop("alternatives", None)
+        booking.pop("alternatives_iso", None)
+        ai = _reply(
+            state,
+            f"Their appointment is CONFIRMED for {booking['confirmed_time']} under "
+            f"{booking.get('name')}. Confirm it warmly and say they'll get a reminder.",
+        )
+    elif result["status"] == "conflict":
+        booking["status"] = "conflict"
+        alts = [format_slot(s) for s in result["alternatives"]]
+        booking["alternatives"] = alts
+        booking["alternatives_iso"] = [s.isoformat() for s in result["alternatives"]]
+        offered = "; ".join(alts) if alts else "no nearby slots"
+        ai = _reply(
+            state,
+            f"The requested time ({format_slot(result['requested'])}) is already taken. "
+            f"Apologise briefly and offer these available slots: {offered}. Ask them to pick one.",
+        )
+    else:  # need_time
+        booking["status"] = "collecting"
+        ai = _reply(
+            state,
+            "You couldn't work out a concrete appointment time from their message. Politely ask "
+            "them to give a specific day and time within opening hours (Mon–Sat 9:30am–8pm, Sun 10am–2pm).",
+        )
+
     return {"booking_info": booking, "messages": [ai]}
 
 
