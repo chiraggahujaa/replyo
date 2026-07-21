@@ -62,9 +62,11 @@ class BookingInfo(TypedDict, total=False):
     # Scheduling outcome, written by handle_booking via the booking service.
     status: str                  # collecting | conflict | confirmed
     confirmed_time: str | None   # human label of the booked slot
+    confirmed_iso: str | None    # ISO of the booked slot; anchors a later reschedule
     event_id: str | None         # calendar provider's event id
     alternatives: list[str]      # human labels offered on a conflict
     alternatives_iso: list[str]  # same slots as ISO, for resolving the user's pick
+    reschedule_from_event_id: str | None  # old event to release once a reschedule confirms
 
 
 class ConversationState(TypedDict, total=False):
@@ -81,8 +83,16 @@ class ConversationState(TypedDict, total=False):
     booking_info: BookingInfo
 
     # Set True when a message should be handed to a human (e.g. a complaint).
-    # The approval dashboard that consumes this arrives in Step 6.
     needs_human: bool
+
+    # Human-in-the-loop (Step 6): the AI-drafted reply held for human approval and
+    # why it was escalated. The human_review node interrupts on these.
+    review_draft: str
+    review_reason: str
+
+    # The apologetic acknowledgement sent to the customer immediately on escalation,
+    # while the substantive reply waits for human approval.
+    holding_message: str
 
     # Source filenames backing the last RAG answer (empty when we refused/none found).
     citations: list[str]

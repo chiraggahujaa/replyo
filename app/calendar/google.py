@@ -11,6 +11,7 @@ from datetime import datetime
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 # Read + write events.
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
@@ -44,3 +45,14 @@ class GoogleCalendar:
         }
         created = self._service.events().insert(calendarId=self._calendar_id, body=event).execute()
         return created["id"]
+
+    def cancel_event(self, event_id: str) -> None:
+        try:
+            self._service.events().delete(
+                calendarId=self._calendar_id, eventId=event_id
+            ).execute()
+        except HttpError as exc:
+            # 404/410 -> already deleted or never existed; treat as success.
+            if exc.resp.status in (404, 410):
+                return
+            raise

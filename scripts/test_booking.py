@@ -143,10 +143,58 @@ async def run_node_flow():
           f"{bi2.get('confirmed_time')} != {expected}")
 
 
+async def run_reschedule_flow():
+    print("\n\033[1m4) handle_booking flow — reschedule + confirmed acknowledgement\033[0m")
+    from langgraph.checkpoint.memory import MemorySaver
+    from app.graph.build import build_graph, run_turn
+
+    now = datetime.now(TZ)
+    s1 = first_slot_after(now + timedelta(days=1))
+    s2 = first_slot_after(s1 + timedelta(hours=2))  # a different, free slot
+
+    cal = InMemoryCalendar()
+    nodes.get_calendar = lambda: cal
+    booking_mod.parse_requested_time = fixed_parse(s1)  # initial booking resolves to s1
+    _stub_llm()
+
+    graph = build_graph(MemorySaver())
+
+    # Book s1.
+    r1 = await run_turn(graph, "rs", "Book me in, I'm Zoe, 98450 22222, tomorrow please")
+    bi1 = r1["booking_info"] or {}
+    check("initial booking confirmed", bi1.get("status") == "confirmed", str(bi1))
+    old_event = bi1.get("event_id")
+    check("s1 is now busy", not cal.is_free(s1, s1 + timedelta(minutes=30)))
+
+    # Reschedule to s2 — the confirmed branch parses via nodes.parse_requested_time.
+    nodes.parse_requested_time = lambda text, *, now, tz: ParsedTime(
+        understood=True, start_iso=s2.isoformat()
+    )
+    r2 = await run_turn(graph, "rs", "actually can you move it a bit later")
+    bi2 = r2["booking_info"] or {}
+    check("reschedule confirmed", bi2.get("status") == "confirmed", str(bi2))
+    check("moved to the new slot", bi2.get("confirmed_time") == format_slot(s2),
+          f"{bi2.get('confirmed_time')} != {format_slot(s2)}")
+    check("event id changed on move", bool(bi2.get("event_id")) and bi2.get("event_id") != old_event)
+    check("old slot released", cal.is_free(s1, s1 + timedelta(minutes=30)))
+    check("new slot now busy", not cal.is_free(s2, s2 + timedelta(minutes=30)))
+
+    # A confirmed booking + a message with NO new time -> acknowledge, don't rebook.
+    nodes.parse_requested_time = lambda text, *, now, tz: ParsedTime(understood=False, start_iso=None)
+    kept_event = bi2.get("event_id")
+    r3 = await run_turn(graph, "rs", "great, thank you so much!")
+    bi3 = r3["booking_info"] or {}
+    check("still confirmed after ack", bi3.get("status") == "confirmed", str(bi3))
+    check("no rebooking on ack (event unchanged)", bi3.get("event_id") == kept_event,
+          f"{bi3.get('event_id')} != {kept_event}")
+    check("no duplicate event created", not cal.is_free(s2, s2 + timedelta(minutes=30)))
+
+
 def main():
     test_try_book_unit()
     test_clinic_hours()
     asyncio.run(run_node_flow())
+    asyncio.run(run_reschedule_flow())
     print("\n" + "=" * 56)
     if FAILURES:
         print(f"  {len(FAILURES)} FAILURES: {FAILURES}")

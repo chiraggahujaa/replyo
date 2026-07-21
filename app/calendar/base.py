@@ -21,3 +21,11 @@ class CalendarBackend(Protocol):
     def create_event(self, start: datetime, end: datetime, summary: str, description: str) -> str:
         """Create an event and return a provider event id."""
         ...
+
+    def cancel_event(self, event_id: str) -> None:
+        """Delete an event by id. Idempotent — a no-op if it's already gone.
+
+        Used when a reschedule books a new slot and must release the old one so the
+        patient isn't left double-booked.
+        """
+        ...

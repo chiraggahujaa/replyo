@@ -7,10 +7,11 @@ humans, and follows up automatically.
 
 Built step by step with **Python + LangGraph + FastAPI + Postgres (Supabase)**.
 
-## What's built (Steps 1–4)
+## What's built (Steps 1–4 + 6)
 
 A working end-to-end slice with intent routing, lead/booking slot-filling,
-document-grounded answers, and real appointment booking:
+document-grounded answers, real appointment booking, and human-in-the-loop
+approval for sensitive replies:
 
 ```
 inbound message ──▶ FastAPI /chat  or  Telegram bot
@@ -20,11 +21,14 @@ inbound message ──▶ FastAPI /chat  or  Telegram bot
                                     ├─ question ─────────▶ answer_from_docs ▶ END   (RAG + citations)
                                     ├─ existing_customer ▶ respond ──────────▶ END
                                     ├─ booking_request ──▶ handle_booking ───▶ END   (Google Calendar)
-                                    ├─ complaint ────────▶ handle_complaint ─▶ END
+                                    ├─ complaint ────────▶ handle_complaint ─▶ human_review ⏸─▶ END   (draft → human approval)
                                     └─ spam ─────────────▶ handle_spam ──────▶ END
                         │
                         ▼
-        Postgres checkpointer (Supabase) + pgvector (docs) + Google Calendar (bookings)
+   Postgres checkpointer + pending_reviews queue (Supabase) + pgvector (docs) + Google Calendar (bookings)
+                        │
+                        ▼
+        Next.js approval dashboard ─▶ approve / edit / reject ─▶ resume graph ─▶ reply sent
 ```
 
 - **triage** classifies each message into six intents and a conditional edge routes to one handler.
@@ -35,12 +39,22 @@ inbound message ──▶ FastAPI /chat  or  Telegram bot
   gate (refuse if nothing is close enough) and a strict grounding prompt (never invent prices/policies).
 - **handle_booking** collects name/time/contact, then the booking service parses the requested time
   (LLM does NLU → Python does the date math), checks the calendar, and **books a real Google Calendar
-  event** — or, on a conflict, offers the next free slots and books the one the patient picks. Falls back
-  to an in-memory calendar when Google isn't configured, so it runs with zero setup.
-- **handle_complaint** sets `needs_human = true` (the approval dashboard consuming it lands in Step 6).
+  event** — or, on a conflict, offers the next free slots and books the one the patient picks. A patient
+  who's already booked can **reschedule** just by naming a new time: it rebooks and releases the old slot,
+  reusing the name/contact on file (it never re-asks). Falls back to an in-memory calendar when Google
+  isn't configured, so it runs with zero setup.
+- **handle_complaint** does *not* reply to the customer directly — it **drafts** an empathetic reply and
+  escalates. The next node, **human_review**, calls LangGraph's `interrupt()` to **pause the graph** (the full
+  conversation is checkpointed to Postgres) and the caller queues the draft into a `pending_reviews` table.
+  The customer gets a short holding message. A reviewer then acts on it from the **Next.js dashboard**:
+  **approve** sends the draft as-is, **edit** sends their revised text, **reject** sends a safe handoff. The
+  decision resumes the paused graph (`Command(resume=…)`), which finalises the reply and delivers it back on
+  the customer's original channel (Telegram push, or stored on the review row for the web/API caller).
 - Every turn is persisted per `thread_id`, so a returning user is picked up where they left off.
 
-`/chat` returns `intent`, `reply`, `lead_info`, `booking_info`, `citations`, and `needs_human`.
+`/chat` returns `intent`, `reply`, `held`, `review_id`, `lead_info`, `booking_info`, `citations`, and
+`needs_human`. When a message is escalated, `held` is `true`, `reply` is the holding message, and `review_id`
+points at the queued item; the real reply goes out only once a human approves it.
 
 ## Setup
 
@@ -60,10 +74,16 @@ inbound message ──▶ FastAPI /chat  or  Telegram bot
    - `DATABASE_URL` — Supabase **Session pooler** string (port `5432`, `?sslmode=require`)
    - `TELEGRAM_BOT_TOKEN` — from [@BotFather](https://t.me/BotFather)
 
-4. **Create the checkpointer tables (one time):**
+4. **Provision the database tables (one time):**
    ```bash
-   uv run python scripts/setup_checkpointer.py
+   uv run python scripts/setup_checkpointer.py   # LangGraph checkpointer tables (library-owned)
+   uv run python scripts/migrate.py              # app tables from supabase/migrations/ (pending_reviews)
    ```
+   `scripts/migrate.py` reads `DATABASE_URL` from `.env` and runs `supabase db push --db-url …` — no
+   `supabase link` needed, so the project's database can live under a different Supabase account than
+   your CLI login. Pass `--dry-run` to preview first. The DDL is idempotent, so it's safe against a
+   database that already has the table. The pgvector store's own table is created automatically on
+   first ingest (next step).
 
 5. **Ingest the clinic documents into pgvector (one time, re-run after editing `data/`):**
    ```bash
@@ -101,6 +121,17 @@ uv run python -m app.channels.telegram_bot
 ```
 Then message your bot on Telegram.
 
+**Approval dashboard (Next.js):**
+```bash
+cd dashboard
+npm install          # first time only
+npm run dev          # http://localhost:3000
+```
+The dashboard polls the API's `/reviews` endpoints (point it elsewhere via `NEXT_PUBLIC_API_URL` in
+`dashboard/.env.local` if the API isn't on `localhost:8000`). Send the bot a complaint, watch it land in the
+queue, then **approve / edit / reject** — the final reply is delivered back to that Telegram chat. The
+`pending_reviews` table comes from the migration you applied in setup (`supabase db push`).
+
 ## Layout
 
 ```
@@ -108,18 +139,24 @@ app/
   config.py            # env / settings (pydantic-settings)
   llm.py               # ChatOpenAI factory
   graph/
-    state.py           # ConversationState + LeadInfo + BookingInfo
-    nodes.py           # triage, qualify, answer_from_docs (RAG), respond, handle_*
-    build.py           # graph assembly, conditional routing + run_turn helper
+    state.py           # ConversationState + LeadInfo + BookingInfo + review fields
+    nodes.py           # triage, qualify, answer_from_docs (RAG), respond, handle_*, human_review
+    build.py           # graph assembly, routing, run_turn + resume_review (interrupt/resume)
   rag.py               # embeddings + pgvector store + retrieve() helper
   booking.py           # clinic hours, slot logic, NL time parse, try_book (conflict handling)
   calendar/            # calendar backends: base (interface), memory, google + get_calendar()
-  api.py               # FastAPI: /health, /chat
+  reviews.py           # pending_reviews queue (Postgres): create / list / get / resolve
+  notify.py            # deliver an approved reply back to the customer's channel
+  api.py               # FastAPI: /health, /chat, /reviews, /reviews/{id}, /reviews/{id}/decision
   channels/
-    telegram_bot.py    # Telegram long-polling worker (+ /start, /reset)
+    telegram_bot.py    # Telegram long-polling worker (+ /start, /reset; queues escalations)
 data/                  # clinic documents (pricing, services, policies, hours)
+dashboard/             # Next.js approval dashboard (review-queue UI, polls the API)
+supabase/
+  migrations/          # SQL migrations for app-owned tables (pending_reviews, …)
 scripts/
   setup_checkpointer.py
+  migrate.py           # apply supabase/migrations via `supabase db push` (reads DATABASE_URL from .env)
   ingest_docs.py       # chunk + embed data/*.md into pgvector
   smoke_chat.py        # comprehensive live test harness (real OpenAI + Supabase)
   test_booking.py      # deterministic booking + conflict tests (offline)
@@ -131,7 +168,7 @@ scripts/
 - ~~**Step 2** — per-intent routing + lead qualification (need/timeline/contact)~~ ✅
 - ~~**Step 3** — RAG over clinic docs (pgvector) with citations + no-hallucination guard~~ ✅
 - ~~**Step 4** — appointment booking (Google Calendar) with conflict handling~~ ✅
-- **Step 5** — CRM sync (Airtable / HubSpot free tier)
-- **Step 6** — human-in-the-loop escalation + Next.js approval dashboard
+- **Step 5** — CRM sync (Airtable / HubSpot free tier)  *(deferred)*
+- ~~**Step 6** — human-in-the-loop escalation + Next.js approval dashboard~~ ✅
 - **Step 7** — scheduled 48h re-engagement follow-ups
 - **Cross-cutting** — web chat widget, WhatsApp channel, LangSmith tracing

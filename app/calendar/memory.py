@@ -24,3 +24,7 @@ class InMemoryCalendar:
         event_id = f"mem-{uuid.uuid4().hex[:12]}"
         self._events.append((start, end, event_id))
         return event_id
+
+    def cancel_event(self, event_id: str) -> None:
+        # Drop the matching interval; silently ignore an unknown id (idempotent).
+        self._events = [ev for ev in self._events if ev[2] != event_id]

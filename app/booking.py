@@ -176,6 +176,41 @@ def parse_requested_time(
 ParseFn = Callable[..., ParsedTime]
 
 
+def reserve_slot(
+    booking: dict,
+    calendar: CalendarBackend,
+    target: datetime,
+    *,
+    now: datetime,
+    tz: ZoneInfo,
+) -> dict:
+    """Reserve a concrete `target` time: snap to the clinic grid, check the calendar,
+    then create the event or return a conflict with alternatives.
+
+    Split out from try_book so callers that already resolved a time (e.g. a reschedule,
+    where the day is anchored to the existing appointment) can reuse the
+    availability/creation logic without parsing text again. Returns the same result
+    shapes as try_book.
+    """
+    snapped = snap_to_clinic(target, now, tz)
+    if snapped is None:
+        return {"status": "need_time"}
+    start, end = snapped
+
+    if calendar.is_free(start, end):
+        name = booking.get("name", "patient")
+        contact = booking.get("contact", "")
+        event_id = calendar.create_event(
+            start, end,
+            summary=f"Dental appointment — {name}",
+            description=f"Booked via Replyo. Patient: {name}. Contact: {contact}.",
+        )
+        return {"status": "confirmed", "start": start, "event_id": event_id}
+
+    alternatives = find_available(start, tz, calendar, count=3, exclude={start})
+    return {"status": "conflict", "requested": start, "alternatives": [s for s, _ in alternatives]}
+
+
 def try_book(
     booking: dict,
     calendar: CalendarBackend,
@@ -184,7 +219,7 @@ def try_book(
     now: Optional[datetime] = None,
     parse: Optional[ParseFn] = None,
 ) -> dict:
-    """Attempt to book from a ready booking_info. Returns a result dict:
+    """Attempt to book from a ready booking_info by parsing a time out of `user_text`.
 
       {"status": "need_time"}                              -> couldn't determine a time
       {"status": "confirmed", "start", "event_id"}         -> event created
@@ -203,20 +238,4 @@ def try_book(
     if target.tzinfo is None:
         target = target.replace(tzinfo=tz)
 
-    snapped = snap_to_clinic(target, now, tz)
-    if snapped is None:
-        return {"status": "need_time"}
-    start, end = snapped
-
-    if calendar.is_free(start, end):
-        name = booking.get("name", "patient")
-        contact = booking.get("contact", "")
-        event_id = calendar.create_event(
-            start, end,
-            summary=f"Dental appointment — {name}",
-            description=f"Booked via Replyo. Patient: {name}. Contact: {contact}.",
-        )
-        return {"status": "confirmed", "start": start, "event_id": event_id}
-
-    alternatives = find_available(start, tz, calendar, count=3, exclude={start})
-    return {"status": "conflict", "requested": start, "alternatives": [s for s, _ in alternatives]}
+    return reserve_slot(booking, calendar, target, now=now, tz=tz)

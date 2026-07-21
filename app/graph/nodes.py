@@ -15,16 +15,22 @@ to exactly one handler (see build.py) and merges what it returns into the state.
 
 from __future__ import annotations
 
+import logging
+from datetime import datetime
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from langchain_core.messages import AIMessage, SystemMessage
+from langgraph.types import interrupt
 from pydantic import BaseModel, Field
 
-from app.booking import format_slot, try_book
+from app.booking import clinic_tz, format_slot, parse_requested_time, reserve_slot, try_book
 from app.calendar import get_calendar
 from app.graph.state import BookingInfo, ConversationState, Intent, LeadInfo
 from app.llm import get_chat_model
 from app.rag import retrieve
+
+logger = logging.getLogger("replyo.nodes")
 
 # --- Business persona (Step 1 stub; RAG over real docs comes in Step 3) ---
 CLINIC_NAME = "BrightSmile Dental"
@@ -222,14 +228,114 @@ class BookingExtraction(BaseModel):
     )
 
 
-def handle_booking(state: ConversationState) -> dict:
-    """Booking request: collect name + time + contact, then reserve a real slot.
+def _apply_confirmation(state: ConversationState, booking: dict, result: dict) -> AIMessage:
+    """Record a confirmed slot on `booking` and craft the reply.
 
-    Phase 1 (collecting): same slot-fill engine as qualify — can't proceed until
-    name + preferred_time + contact are all present.
-    Phase 2 (ready): hand off to the booking service, which parses the time, checks
-    the calendar, and either confirms the slot or offers alternatives on a conflict.
-    On a conflict the user's next message (their pick) re-enters here and re-books.
+    If this is the tail of a reschedule (a `reschedule_from_event_id` marker is set),
+    release the old event so the patient isn't left double-booked, and phrase the reply
+    as a move rather than a fresh booking.
+    """
+    new_event = result["event_id"]
+    old_event = booking.pop("reschedule_from_event_id", None)
+    booking["status"] = "confirmed"
+    booking["confirmed_time"] = format_slot(result["start"])
+    booking["confirmed_iso"] = result["start"].isoformat()
+    booking["event_id"] = new_event
+    booking.pop("alternatives", None)
+    booking.pop("alternatives_iso", None)
+
+    moved = bool(old_event) and old_event != new_event
+    if moved:
+        try:
+            get_calendar().cancel_event(old_event)
+        except Exception:  # best-effort: a stale old event shouldn't fail the rebooking
+            logger.exception("Failed to cancel old event %s during reschedule", old_event)
+
+    name = booking.get("name")
+    if moved:
+        instructions = (
+            f"Their appointment has been MOVED to {booking['confirmed_time']} under {name}; the "
+            "previous time has been released. Confirm the change warmly and say they'll get a "
+            "reminder. Do NOT ask for their name or contact — you already have them."
+        )
+    else:
+        instructions = (
+            f"Their appointment is CONFIRMED for {booking['confirmed_time']} under {name}. "
+            "Confirm it warmly and say they'll get a reminder."
+        )
+    return _reply(state, instructions)
+
+
+def _offer_alternatives(state: ConversationState, booking: dict, result: dict) -> AIMessage:
+    """Record the offered alternatives on a conflict and ask the patient to pick one."""
+    alts = [format_slot(s) for s in result["alternatives"]]
+    booking["status"] = "conflict"
+    booking["alternatives"] = alts
+    booking["alternatives_iso"] = [s.isoformat() for s in result["alternatives"]]
+    offered = "; ".join(alts) if alts else "no nearby slots"
+    return _reply(
+        state,
+        f"The requested time ({format_slot(result['requested'])}) is already taken. Apologise "
+        f"briefly and offer these available slots: {offered}. Ask them to pick one. Do NOT ask "
+        "for their name or contact — you already have them.",
+    )
+
+
+def _confirmed_ack_reply(state: ConversationState, booking: dict) -> AIMessage:
+    """Reply when a patient with a confirmed booking writes but proposes no new time."""
+    return _reply(
+        state,
+        f"They already have a CONFIRMED appointment for {booking.get('confirmed_time')} under "
+        f"{booking.get('name')} (contact on file: {booking.get('contact')}). Acknowledge warmly. "
+        "If they want to change it, ask for the specific new day and time they'd like; if they want "
+        "to cancel, tell them our team will take care of it. Do NOT ask for their name or contact "
+        "again, and NEVER claim you can't see previous messages or that you'll 'check and get back'.",
+    )
+
+
+def _reschedule_target(
+    state: ConversationState, booking: dict, *, now: datetime, tz: ZoneInfo
+) -> Optional[datetime]:
+    """If the latest message asks to move the booking to a concrete new time, return it.
+
+    Returns None when the message proposes no specific new time (or restates the current
+    one) — the caller then just acknowledges instead of rebooking. The current
+    appointment's day anchors a time-only request like "change it to 4pm" (the parser
+    needs a day, which the message alone doesn't carry).
+    """
+    current = booking.get("confirmed_time") or "their current appointment"
+    latest = _latest_user_text(state)
+    context = (
+        f"The patient already has a CONFIRMED dental appointment on {current}. They just sent "
+        f"this message: {latest!r}. If they are asking to move/reschedule to a specific new time, "
+        "extract that NEW day and time; if they give a new time but not a new day, use the SAME "
+        "DAY as the current appointment. If they are NOT proposing a specific new time (just "
+        "acknowledging, thanking, or asking something else), set understood=false."
+    )
+    parsed = parse_requested_time(context, now=now, tz=tz)
+    if not parsed.understood or not parsed.start_iso:
+        return None
+    target = datetime.fromisoformat(parsed.start_iso)
+    if target.tzinfo is None:
+        target = target.replace(tzinfo=tz)
+    # Restating the same slot isn't a change.
+    if booking.get("confirmed_iso") and datetime.fromisoformat(booking["confirmed_iso"]) == target:
+        return None
+    return target
+
+
+def handle_booking(state: ConversationState) -> dict:
+    """Book, reschedule, or keep collecting details for an appointment.
+
+    - collecting: slot-fill name + preferred_time + contact (can't book until all present).
+    - ready: parse the time, check the calendar, then confirm or offer alternatives on a conflict.
+    - already confirmed: treat a concrete new time as a RESCHEDULE (rebook + release the old
+      slot); otherwise just acknowledge — reusing the name/contact already on file so we never
+      re-ask or pretend we can't see the history.
+
+    On a conflict the patient's next message (their pick) re-enters here and re-books; if a
+    reschedule hit a conflict, the pending old-event marker rides along so the pick still
+    releases the original slot.
     """
     booking: BookingInfo = _extract_and_merge(  # type: ignore[assignment]
         state,
@@ -241,13 +347,23 @@ def handle_booking(state: ConversationState) -> dict:
         extraction_hint="Extract appointment-booking details from the conversation for a dental clinic.",
     )
 
-    # Already booked earlier — don't create a duplicate; acknowledge.
+    tz = clinic_tz()
+    now = datetime.now(tz)
+
+    # Already booked -> reschedule (a concrete new time) or simply acknowledge.
     if booking.get("status") == "confirmed":
-        ai = _reply(
-            state,
-            f"They already have a confirmed appointment for {booking.get('confirmed_time')}. "
-            "Acknowledge warmly; if they want to change it, ask what new time they'd prefer.",
-        )
+        target = _reschedule_target(state, booking, now=now, tz=tz)
+        if target is None:
+            return {"booking_info": booking, "messages": [_confirmed_ack_reply(state, booking)]}
+        booking["reschedule_from_event_id"] = booking.get("event_id")
+        result = reserve_slot(booking, get_calendar(), target, now=now, tz=tz)
+        if result["status"] == "confirmed":
+            ai = _apply_confirmation(state, booking, result)
+        elif result["status"] == "conflict":
+            ai = _offer_alternatives(state, booking, result)
+        else:  # couldn't place the new time -> keep the existing booking, just acknowledge
+            booking.pop("reschedule_from_event_id", None)
+            ai = _confirmed_ack_reply(state, booking)
         return {"booking_info": booking, "messages": [ai]}
 
     # Phase 1: still missing a required slot -> keep collecting.
@@ -263,10 +379,9 @@ def handle_booking(state: ConversationState) -> dict:
         )
         return {"booking_info": booking, "messages": [ai]}
 
-    # Phase 2: ready -> attempt to reserve a real calendar slot.
-    # Feed the parser the accumulated requested time (not just the latest message,
-    # which may have been the name/contact turn) plus the latest message so it can
-    # also resolve a conflict-pick like "the first option".
+    # Phase 2: ready -> attempt to reserve. Feed the parser the accumulated requested
+    # time plus the latest message so it can also resolve a conflict-pick like "the
+    # first option". try_book resolves the parser from app.booking at call time (test hook).
     time_text = (
         f"Requested time: {booking.get('preferred_time') or 'unspecified'}. "
         f"Latest message: {_latest_user_text(state)}"
@@ -274,27 +389,9 @@ def handle_booking(state: ConversationState) -> dict:
     result = try_book(booking, get_calendar(), time_text)
 
     if result["status"] == "confirmed":
-        booking["status"] = "confirmed"
-        booking["confirmed_time"] = format_slot(result["start"])
-        booking["event_id"] = result["event_id"]
-        booking.pop("alternatives", None)
-        booking.pop("alternatives_iso", None)
-        ai = _reply(
-            state,
-            f"Their appointment is CONFIRMED for {booking['confirmed_time']} under "
-            f"{booking.get('name')}. Confirm it warmly and say they'll get a reminder.",
-        )
+        ai = _apply_confirmation(state, booking, result)
     elif result["status"] == "conflict":
-        booking["status"] = "conflict"
-        alts = [format_slot(s) for s in result["alternatives"]]
-        booking["alternatives"] = alts
-        booking["alternatives_iso"] = [s.isoformat() for s in result["alternatives"]]
-        offered = "; ".join(alts) if alts else "no nearby slots"
-        ai = _reply(
-            state,
-            f"The requested time ({format_slot(result['requested'])}) is already taken. "
-            f"Apologise briefly and offer these available slots: {offered}. Ask them to pick one.",
-        )
+        ai = _offer_alternatives(state, booking, result)
     else:  # need_time
         booking["status"] = "collecting"
         ai = _reply(
@@ -306,14 +403,93 @@ def handle_booking(state: ConversationState) -> dict:
     return {"booking_info": booking, "messages": [ai]}
 
 
-def handle_complaint(state: ConversationState) -> dict:
-    """Complaint: empathise, reassure — and flag for a human to pick up (Step 6 dashboard)."""
-    ai = _reply(
-        state,
-        "This is a complaint. Be genuinely empathetic, apologise, and assure them a team "
-        "member will personally follow up shortly. Do not make promises about compensation.",
+class ComplaintReplies(BaseModel):
+    """Two replies for a complaint, produced in one pass."""
+
+    acknowledgement: str = Field(
+        description=(
+            "The message sent to the customer IMMEDIATELY (1–2 sentences). FIRST sincerely "
+            "apologise for their specific concern, THEN let them know you're looping in a team "
+            "member who will personally follow up shortly. Warm and human. Do NOT promise any "
+            "refund, compensation, or specific remedy."
+        )
     )
-    return {"messages": [ai], "needs_human": True}
+    suggested_reply: str = Field(
+        description=(
+            "A fuller, ready-to-send draft that a human teammate will review before it goes out. "
+            "Empathetic and professional; directly address their specific concern and propose a "
+            "concrete, reasonable next step (e.g. look into what happened, arrange a callback, "
+            "invite them back). Do NOT promise compensation or admit legal fault."
+        )
+    )
+
+
+def handle_complaint(state: ConversationState) -> dict:
+    """Complaint: apologise now, and draft a suggested reply for a human to approve.
+
+    Produces two things in one LLM call:
+      - `holding_message`: an apologetic acknowledgement sent to the customer immediately
+        (surfaced by run_turn) — NOT a resolution, just "we hear you, someone's on it".
+      - `review_draft`: a substantive suggested reply that the human_review node holds for
+        approval. We do NOT append it to `messages` — it must not reach the customer until a
+        human approves it.
+    """
+    model = get_chat_model(temperature=0.4).with_structured_output(ComplaintReplies)
+    system = SystemMessage(
+        content=(
+            f"{PERSONA}\n\nThe latest message is a complaint from a patient. Draft the two "
+            "replies described by the schema. Be genuinely empathetic; never blame the patient."
+        )
+    )
+    replies: ComplaintReplies = model.invoke([system, *state["messages"]])  # type: ignore[assignment]
+    return {
+        "holding_message": replies.acknowledgement,
+        "review_draft": replies.suggested_reply,
+        "review_reason": "Upset customer (complaint)",
+        "needs_human": True,
+    }
+
+
+def human_review(state: ConversationState) -> dict:
+    """Pause for human approval, then finalise the reply based on their decision.
+
+    `interrupt()` suspends the graph here; the whole state is checkpointed to
+    Postgres. The dashboard resumes it with Command(resume={"action", "text"}):
+      approve -> send the AI draft as-is
+      edit    -> send the human's edited text
+      reject  -> send a safe fallback (or the human's replacement text)
+    Only after resume do we append the final message to `messages`.
+    """
+    conversation = [
+        {"role": m.type, "content": m.content}
+        for m in state["messages"]
+        if getattr(m, "type", None) in ("human", "ai")
+    ]
+    # Show the reviewer the apologetic acknowledgement the customer already received,
+    # so the suggested-reply box is clearly the NEXT message to send, not a repeat.
+    holding = state.get("holding_message")
+    if holding:
+        conversation.append({"role": "ai", "content": holding})
+    decision = interrupt(
+        {
+            "reason": state.get("review_reason", "Needs human review"),
+            "draft": state.get("review_draft", ""),
+            "conversation": conversation,
+        }
+    )
+
+    draft = state.get("review_draft", "")
+    action = (decision or {}).get("action", "approve")
+    if action == "edit":
+        final = (decision or {}).get("text") or draft
+    elif action == "reject":
+        final = (decision or {}).get("text") or (
+            "Thank you for your patience — one of our team members will personally reach out to you shortly."
+        )
+    else:  # approve
+        final = draft
+
+    return {"messages": [AIMessage(content=final)], "needs_human": True}
 
 
 def handle_spam(state: ConversationState) -> dict:

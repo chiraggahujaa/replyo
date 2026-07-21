@@ -1,0 +1,106 @@
+@import "tailwindcss";
+
+/* ---- Design tokens ---------------------------------------------------- */
+:root {
+  --bg: #f6f7f9;
+  --bg-soft: #eceef2;
+  --surface: #ffffff;
+  --surface-2: #fbfbfd;
+  --border: #e6e8ee;
+  --border-strong: #d6d9e2;
+  --text: #14161d;
+  --text-muted: #646b7a;
+  --text-faint: #949aa8;
+  --accent: #6366f1;
+  --accent-ink: #4f46e5;
+  --ring: rgba(99, 102, 241, 0.35);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0a0b0f;
+    --bg-soft: #101218;
+    --surface: #14161d;
+    --surface-2: #171a22;
+    --border: #232733;
+    --border-strong: #2d3240;
+    --text: #eceef4;
+    --text-muted: #9aa1b1;
+    --text-faint: #6b7284;
+    --accent: #7c7ff2;
+    --accent-ink: #a5a7fb;
+    --ring: rgba(124, 127, 242, 0.4);
+  }
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-bg-soft: var(--bg-soft);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
+  --color-text: var(--text);
+  --color-muted: var(--text-muted);
+  --color-faint: var(--text-faint);
+  --color-accent: var(--accent);
+  --color-accent-ink: var(--accent-ink);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+* {
+  border-color: var(--border);
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans), ui-sans-serif, system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+::selection {
+  background: var(--ring);
+}
+
+/* Refined scrollbars */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+*::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.animate-in { animation: fade-in 0.22s ease-out both; }
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(10px) scale(0.98); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+.animate-toast { animation: toast-in 0.24s cubic-bezier(0.16, 1, 0.3, 1) both; }
+
+@keyframes pulse-ring {
+  0% { box-shadow: 0 0 0 0 var(--ring); }
+  70% { box-shadow: 0 0 0 5px transparent; }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
+.live-dot { animation: pulse-ring 2s infinite; }

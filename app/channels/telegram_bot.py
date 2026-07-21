@@ -25,6 +25,7 @@ from telegram.ext import (
 
 from app.config import settings
 from app.graph.build import graph_with_checkpointer, run_turn
+from app.reviews import create_review
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -68,14 +69,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     graph = context.bot_data["graph"]
     result = await run_turn(graph, thread_id, text)
 
-    logger.info("chat=%s intent=%s", chat_id, result["intent"])
+    logger.info("chat=%s intent=%s held=%s", chat_id, result["intent"], result.get("held"))
     await update.message.reply_text(result["reply"])
+
+    # If escalated, queue it for the human-approval dashboard.
+    if result.get("held"):
+        review_id = await create_review(
+            thread_id=thread_id, channel="telegram", chat_id=str(chat_id), review=result["review"]
+        )
+        logger.info("queued review %s for chat=%s", review_id, chat_id)
 
 
 async def _post_init(application: Application) -> None:
     """Open the checkpointer-backed graph once and keep it for the process."""
     # Enter the async context manually and stash both the graph and the context
-    # manager so we can close the Postgres pool on shutdown.
+    # manager so we can close the Postgres pool on shutdown. (The pending_reviews
+    # table is provisioned via Supabase migrations, not here.)
     cm = graph_with_checkpointer()
     graph = await cm.__aenter__()
     application.bot_data["graph"] = graph
