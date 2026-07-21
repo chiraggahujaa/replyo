@@ -33,6 +33,13 @@ class Settings(BaseSettings):
     # IANA timezone for appointment times.
     clinic_timezone: str = "Asia/Kolkata"
 
+    # --- Step 7: scheduled re-engagement follow-ups ---
+    # How long after a patient's LAST message we nudge them if they never converted.
+    # A float so it can be set to e.g. 0.001 to test the worker without waiting 2 days.
+    followup_delay_hours: float = 48.0
+    # Cap on nudges per conversation, so a cold lead is never nagged.
+    followup_max_sends: int = 1
+
     # --- Optional LangSmith tracing ---
     langsmith_tracing: bool = False
     langsmith_api_key: str = ""

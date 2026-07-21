@@ -21,7 +21,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from app import reviews
+from app import followups, reviews
 from app.graph.build import graph_with_checkpointer, resume_review, run_turn
 from app.notify import send_to_channel
 
@@ -85,6 +85,10 @@ async def chat(req: ChatRequest) -> ChatResponse:
         review_id = await reviews.create_review(
             thread_id=req.thread_id, channel="api", chat_id=req.thread_id, review=result["review"]
         )
+    # Arm (or clear) the 48h re-engagement nudge for this conversation.
+    await followups.record_turn(
+        thread_id=req.thread_id, channel="api", chat_id=req.thread_id, result=result
+    )
     return ChatResponse(
         intent=result["intent"],
         reply=result["reply"],

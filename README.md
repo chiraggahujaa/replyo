@@ -7,11 +7,11 @@ humans, and follows up automatically.
 
 Built step by step with **Python + LangGraph + FastAPI + Postgres (Supabase)**.
 
-## What's built (Steps 1–4 + 6)
+## What's built (Steps 1–4, 6–7)
 
 A working end-to-end slice with intent routing, lead/booking slot-filling,
-document-grounded answers, real appointment booking, and human-in-the-loop
-approval for sensitive replies:
+document-grounded answers, real appointment booking, human-in-the-loop approval
+for sensitive replies, and automatic re-engagement of cold leads:
 
 ```
 inbound message ──▶ FastAPI /chat  or  Telegram bot
@@ -25,10 +25,11 @@ inbound message ──▶ FastAPI /chat  or  Telegram bot
                                     └─ spam ─────────────▶ handle_spam ──────▶ END
                         │
                         ▼
-   Postgres checkpointer + pending_reviews queue (Supabase) + pgvector (docs) + Google Calendar (bookings)
+   Postgres checkpointer + pending_reviews + follow_ups (Supabase) + pgvector (docs) + Google Calendar
                         │
-                        ▼
-        Next.js approval dashboard ─▶ approve / edit / reject ─▶ resume graph ─▶ reply sent
+                        ├──▶ Next.js approval dashboard ─▶ approve / edit / reject ─▶ resume graph ─▶ reply sent
+                        │
+                        └──▶ follow-up worker (cron) ─▶ 48h after a cold thread ─▶ re-engagement nudge sent
 ```
 
 - **triage** classifies each message into six intents and a conditional edge routes to one handler.
@@ -50,6 +51,14 @@ inbound message ──▶ FastAPI /chat  or  Telegram bot
   **approve** sends the draft as-is, **edit** sends their revised text, **reject** sends a safe handoff. The
   decision resumes the paused graph (`Command(resume=…)`), which finalises the reply and delivers it back on
   the customer's original channel (Telegram push, or stored on the review row for the web/API caller).
+- **Follow-ups (Step 7)** — after every turn we decide whether the conversation deserves a nudge later
+  and upsert one `follow_ups` row per thread, so each new message pushes `due_at` out again: the 48h clock
+  runs from the patient's *last* message and only genuinely cold threads are chased. It's deliberately
+  conservative — a **confirmed booking**, an **escalated complaint**, or **spam** cancels the nudge, while a
+  half-finished booking or an enquiry that never booked schedules one. The worker
+  (`scripts/run_followups.py`, cron-friendly) writes a short personalised message from the thread's own
+  history, delivers it on the patient's channel, and appends it to the transcript — so if they reply, the
+  graph picks the conversation up in context. Capped at one nudge per conversation, so nobody gets nagged.
 - Every turn is persisted per `thread_id`, so a returning user is picked up where they left off.
 
 `/chat` returns `intent`, `reply`, `held`, `review_id`, `lead_info`, `booking_info`, `citations`, and
@@ -132,6 +141,18 @@ The dashboard polls the API's `/reviews` endpoints (point it elsewhere via `NEXT
 queue, then **approve / edit / reject** — the final reply is delivered back to that Telegram chat. The
 `pending_reviews` table comes from the migration you applied in setup (`supabase db push`).
 
+**Follow-up worker (Step 7):**
+```bash
+uv run python scripts/run_followups.py                       # one sweep (cron-friendly)
+uv run python scripts/run_followups.py --loop --interval 300 # or keep it polling
+```
+`--dry-run` shows what would be sent without sending; `--force` ignores the 48h timer so you can test
+immediately. You can also set `FOLLOWUP_DELAY_HOURS=0` in `.env` (and `FOLLOWUP_MAX_SENDS` to allow
+repeat nudges) instead of waiting two days. In production this is just a cron entry, e.g. hourly:
+```
+0 * * * * cd /path/to/replyo && uv run python scripts/run_followups.py >> /tmp/replyo-followups.log 2>&1
+```
+
 ## Layout
 
 ```
@@ -146,7 +167,8 @@ app/
   booking.py           # clinic hours, slot logic, NL time parse, try_book (conflict handling)
   calendar/            # calendar backends: base (interface), memory, google + get_calendar()
   reviews.py           # pending_reviews queue (Postgres): create / list / get / resolve
-  notify.py            # deliver an approved reply back to the customer's channel
+  followups.py         # follow_ups queue + "does this thread deserve a nudge?" decision
+  notify.py            # deliver an approved reply / follow-up on the customer's channel
   api.py               # FastAPI: /health, /chat, /reviews, /reviews/{id}, /reviews/{id}/decision
   channels/
     telegram_bot.py    # Telegram long-polling worker (+ /start, /reset; queues escalations)
@@ -158,8 +180,10 @@ scripts/
   setup_checkpointer.py
   migrate.py           # apply supabase/migrations via `supabase db push` (reads DATABASE_URL from .env)
   ingest_docs.py       # chunk + embed data/*.md into pgvector
+  run_followups.py     # send due re-engagement nudges (cron-friendly; --dry-run/--force/--loop)
   smoke_chat.py        # comprehensive live test harness (real OpenAI + Supabase)
-  test_booking.py      # deterministic booking + conflict tests (offline)
+  test_booking.py      # deterministic booking + conflict + reschedule tests (offline)
+  test_followups.py    # deterministic follow-up decision tests (offline)
 ```
 
 ## Roadmap
@@ -170,5 +194,5 @@ scripts/
 - ~~**Step 4** — appointment booking (Google Calendar) with conflict handling~~ ✅
 - **Step 5** — CRM sync (Airtable / HubSpot free tier)  *(deferred)*
 - ~~**Step 6** — human-in-the-loop escalation + Next.js approval dashboard~~ ✅
-- **Step 7** — scheduled 48h re-engagement follow-ups
+- ~~**Step 7** — scheduled 48h re-engagement follow-ups~~ ✅
 - **Cross-cutting** — web chat widget, WhatsApp channel, LangSmith tracing

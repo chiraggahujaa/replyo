@@ -23,6 +23,7 @@ from telegram.ext import (
     filters,
 )
 
+from app import followups
 from app.config import settings
 from app.graph.build import graph_with_checkpointer, run_turn
 from app.reviews import create_review
@@ -78,6 +79,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             thread_id=thread_id, channel="telegram", chat_id=str(chat_id), review=result["review"]
         )
         logger.info("queued review %s for chat=%s", review_id, chat_id)
+
+    # Arm (or clear) the 48h re-engagement nudge for this conversation.
+    reason = await followups.record_turn(
+        thread_id=thread_id, channel="telegram", chat_id=str(chat_id), result=result
+    )
+    logger.info("follow-up for chat=%s: %s", chat_id, reason or "cancelled/none")
 
 
 async def _post_init(application: Application) -> None:
