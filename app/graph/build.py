@@ -19,6 +19,7 @@ from langgraph.types import Command
 
 from app.config import settings
 from app.graph.nodes import (
+    REPLY_TAG,
     answer_from_docs,
     handle_booking,
     handle_complaint,
@@ -103,51 +104,102 @@ async def graph_with_checkpointer():
         yield build_graph(checkpointer)
 
 
-async def run_turn(graph, thread_id: str, text: str) -> dict:
-    """Run one conversation turn and return {"intent", "reply"}.
+def _trace_config(thread_id: str, *, channel: str, run_name: str) -> dict:
+    """Build the invoke config, including LangSmith run naming + metadata.
 
-    Shared by every entry point (FastAPI, Telegram) so the ingest logic lives in
-    exactly one place. `thread_id` selects which persisted conversation to resume.
+    `configurable.thread_id` is what the checkpointer keys on; the rest is purely
+    for tracing, so a run is findable in LangSmith by channel or conversation
+    (filter on the `channel:<name>` tag) instead of scrolling anonymous runs.
+    Harmless when tracing is off — LangChain just ignores it.
     """
-    config = {"configurable": {"thread_id": thread_id}}
-    result = await graph.ainvoke(
-        {"messages": [HumanMessage(content=text)]},
-        config=config,
-    )
+    return {
+        "configurable": {"thread_id": thread_id},
+        "run_name": run_name,
+        "tags": [f"channel:{channel}"],
+        "metadata": {"thread_id": thread_id, "channel": channel},
+    }
 
+
+def _shape_result(values: dict, interrupts) -> dict:
+    """Turn raw graph state into the result dict every caller consumes."""
     # If the graph paused for human review, no reply reached the customer yet — we
     # send a holding message and surface the review payload for the caller to queue.
-    interrupts = result.get("__interrupt__")
     if interrupts:
         return {
-            "intent": result.get("intent"),
-            "reply": result.get("holding_message") or HOLDING_MESSAGE,
+            "intent": values.get("intent"),
+            "reply": values.get("holding_message") or HOLDING_MESSAGE,
             "held": True,
             "review": interrupts[0].value,
-            "lead_info": result.get("lead_info"),
-            "booking_info": result.get("booking_info"),
-            "citations": result.get("citations") or [],
+            "lead_info": values.get("lead_info"),
+            "booking_info": values.get("booking_info"),
+            "citations": values.get("citations") or [],
             "needs_human": True,
         }
 
     return {
-        "intent": result.get("intent"),
-        "reply": result["messages"][-1].content,
+        "intent": values.get("intent"),
+        "reply": values["messages"][-1].content,
         "held": False,
         "review": None,
-        "lead_info": result.get("lead_info"),
-        "booking_info": result.get("booking_info"),
-        "citations": result.get("citations") or [],
-        "needs_human": result.get("needs_human", False),
+        "lead_info": values.get("lead_info"),
+        "booking_info": values.get("booking_info"),
+        "citations": values.get("citations") or [],
+        "needs_human": values.get("needs_human", False),
     }
 
 
-async def resume_review(graph, thread_id: str, decision: dict) -> str:
+async def run_turn(
+    graph, thread_id: str, text: str, *, channel: str = "api", on_token=None
+) -> dict:
+    """Run one conversation turn and return {"intent", "reply", ...}.
+
+    Shared by every entry point (FastAPI, Telegram, WhatsApp, websocket) so the
+    ingest logic lives in exactly one place. `thread_id` selects which persisted
+    conversation to resume; `channel` is trace metadata only. Both extra params are
+    keyword-only, so existing callers and the offline tests work unchanged.
+
+    Pass `on_token` (an async callable) to stream the reply as it's generated.
+    """
+    config = _trace_config(thread_id, channel=channel, run_name=f"replyo:{channel}")
+    inputs = {"messages": [HumanMessage(content=text)]}
+
+    if on_token is None:
+        result = await graph.ainvoke(inputs, config=config)
+        return _shape_result(result, result.get("__interrupt__"))
+
+    # --- streaming path ---
+    # "messages" yields LLM token chunks, "updates" is where an interrupt shows up.
+    #
+    # Only chunks tagged REPLY_TAG are forwarded. Every node ALSO makes structured
+    # -output calls whose raw JSON streams as content, and the complaint handler's
+    # JSON contains the draft that must stay hidden until a human approves it — so
+    # this allow-list is a correctness guard, not a cosmetic filter.
+    interrupts = None
+    async for mode, chunk in graph.astream(inputs, config=config, stream_mode=["updates", "messages"]):
+        if mode == "updates":
+            if isinstance(chunk, dict) and "__interrupt__" in chunk:
+                interrupts = chunk["__interrupt__"]
+        elif mode == "messages":
+            message, meta = chunk
+            content = getattr(message, "content", "")
+            if content and REPLY_TAG in (meta.get("tags") or []):
+                await on_token(content)
+
+    # Read the authoritative persisted state rather than reassembling it from the
+    # stream — the final message may differ from the streamed tokens (answer_from_docs
+    # appends a `Sources:` footer, and a held turn replies with a holding message).
+    snapshot = await graph.aget_state(config)
+    return _shape_result(dict(snapshot.values or {}), interrupts)
+
+
+async def resume_review(graph, thread_id: str, decision: dict, *, channel: str = "api") -> str:
     """Resume a graph paused at human_review with the human's decision.
 
     `decision` is {"action": "approve"|"edit"|"reject", "text": <optional>}.
     Returns the final reply text that should now be delivered to the customer.
+    Traced under its own run name so human-approved resumes are easy to tell apart
+    from ordinary inbound turns.
     """
-    config = {"configurable": {"thread_id": thread_id}}
+    config = _trace_config(thread_id, channel=channel, run_name="replyo:resume")
     result = await graph.ainvoke(Command(resume=decision), config=config)
     return result["messages"][-1].content

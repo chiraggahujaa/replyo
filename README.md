@@ -7,14 +7,15 @@ humans, and follows up automatically.
 
 Built step by step with **Python + LangGraph + FastAPI + Postgres (Supabase)**.
 
-## What's built (Steps 1–4, 6–7)
+## What's built (Steps 1–4, 6–8)
 
 A working end-to-end slice with intent routing, lead/booking slot-filling,
 document-grounded answers, real appointment booking, human-in-the-loop approval
-for sensitive replies, and automatic re-engagement of cold leads:
+for sensitive replies, automatic re-engagement of cold leads, and three inbound
+channels (web widget, Telegram, WhatsApp):
 
 ```
-inbound message ──▶ FastAPI /chat  or  Telegram bot
+inbound message ──▶ web widget  or  Telegram bot  or  WhatsApp  ──▶ FastAPI
                         │
                         ▼
       LangGraph:  START ─▶ triage ─┬─ new_lead ─────────▶ qualify ─────────▶ END
@@ -30,6 +31,11 @@ inbound message ──▶ FastAPI /chat  or  Telegram bot
                         ├──▶ Next.js approval dashboard ─▶ approve / edit / reject ─▶ resume graph ─▶ reply sent
                         │
                         └──▶ follow-up worker (cron) ─▶ 48h after a cold thread ─▶ re-engagement nudge sent
+
+  Both outbound paths reach the patient on whatever channel they used: pushed via the
+  Telegram / WhatsApp APIs, or over the widget's websocket. The follow-up worker is a
+  separate process, so it publishes through Postgres LISTEN/NOTIFY and the API relays
+  it to whichever sockets it holds.
 ```
 
 - **triage** classifies each message into six intents and a conditional edge routes to one handler.
@@ -59,6 +65,20 @@ inbound message ──▶ FastAPI /chat  or  Telegram bot
   (`scripts/run_followups.py`, cron-friendly) writes a short personalised message from the thread's own
   history, delivers it on the patient's channel, and appends it to the transcript — so if they reply, the
   graph picks the conversation up in context. Capped at one nudge per conversation, so nobody gets nagged.
+- **Channels (Step 8)** — one graph, three ways in. Every channel is a thin adapter over
+  `app/inbound.py`, which runs the turn and applies the shared side effects (queue an escalated
+  reply, arm the follow-up nudge), so nothing can drift between them. Thread ids are namespaced
+  (`web:` / `telegram:` / `whatsapp:`) and never collide.
+  - **Web widget** — one `<script>` tag, embeddable on any site, isolated in a Shadow DOM, talking
+    over a **websocket**: replies stream token by token, and messages that answer nothing the
+    visitor just typed (a reply staff approved, a 48h nudge) are pushed to the open socket. It
+    degrades to `POST /chat` + polling if a socket can't be opened, and restores history from the
+    server on reload. Only tokens tagged as customer-facing are ever streamed — every node also
+    makes structured-output calls, and the complaint handler's JSON contains the draft that must
+    stay hidden until a human approves it.
+  - **WhatsApp** — Meta Cloud API webhook (verification handshake + inbound). WhatsApp pushes to
+    us, so unlike Telegram's long-polling it needs a public HTTPS URL. Duplicate deliveries are
+    dropped by message id, since Meta retries and a re-run would double-reply.
 - Every turn is persisted per `thread_id`, so a returning user is picked up where they left off.
 
 `/chat` returns `intent`, `reply`, `held`, `review_id`, `lead_info`, `booking_info`, `citations`, and
@@ -124,6 +144,26 @@ curl -s localhost:8000/chat -H 'content-type: application/json' \
   -d '{"thread_id":"test1","message":"and do you take insurance?"}' | jq
 ```
 
+**Clinic website + chat widget (Next.js):**
+```bash
+cd clinic-site
+npm install          # first time only
+npm run dev          # http://localhost:3000
+```
+A full BrightSmile Dental site (services, pricing, patient info, visit us) with the assistant
+embedded. Its content is transcribed from `data/*.md` into `clinic-site/lib/content.ts` — the same
+documents the assistant answers from, so the page and the chat bubble agree. **Change a price in
+one, change it in the other.**
+
+Embedding the widget on any other site is one tag — it's plain JS in a Shadow DOM, served by the
+API, with nothing Next.js-specific about it:
+```html
+<script src="http://localhost:8000/widget/widget.js" data-api="http://localhost:8000"></script>
+```
+It keeps a `web:<uuid>` thread in `localStorage` (history survives reloads), talks over a
+**websocket** for live token-by-token replies, and falls back to `POST /chat` + polling
+`GET /chat/{id}/messages` if the socket can't be established.
+
 **Telegram bot (long-polling, no public URL needed):**
 ```bash
 uv run python -m app.channels.telegram_bot
@@ -153,6 +193,33 @@ repeat nudges) instead of waiting two days. In production this is just a cron en
 0 * * * * cd /path/to/replyo && uv run python scripts/run_followups.py >> /tmp/replyo-followups.log 2>&1
 ```
 
+**WhatsApp (Meta Cloud API — free to test):** WhatsApp *pushes* to us, so unlike Telegram it
+needs a public HTTPS URL. Free test setup:
+
+1. [developers.facebook.com](https://developers.facebook.com/) → create an app → add the
+   **WhatsApp** product. You get a free test number; copy its **Phone number ID**, and add your
+   own phone as a verified recipient (dev mode allows up to 5).
+2. Put the phone number id, the access token, and any random verify token you invent into `.env`
+   (`WHATSAPP_PHONE_NUMBER_ID`, `WHATSAPP_ACCESS_TOKEN`, `WHATSAPP_VERIFY_TOKEN`). The quick
+   token expires in 24h — create a **System User** token for a permanent one.
+3. Expose the API and register the webhook:
+   ```bash
+   uv run uvicorn app.api:app --reload      # terminal A
+   cloudflared tunnel --url http://localhost:8000   # terminal B — free, no account
+   ```
+   In the Meta app set the Callback URL to `https://<tunnel-host>/webhooks/whatsapp`, paste the
+   same verify token, click **Verify and save**, then subscribe to the **messages** field.
+4. Message the test number from your verified phone.
+
+Replies are free "service conversations" (you're answering someone who messaged you, inside the
+24h window). Leave the vars blank and the channel is simply off — everything else still runs.
+
+**Tracing (optional):** set `LANGSMITH_TRACING=true` and `LANGSMITH_API_KEY` in `.env`, restart,
+then open [smith.langchain.com](https://smith.langchain.com). Each turn is one run named
+`replyo:<channel>` (and `replyo:resume` for human-approved resumes), tagged `channel:telegram` /
+`channel:web` / `channel:whatsapp` and carrying `thread_id` metadata — so you can jump straight
+to one conversation and see the `triage → handler` node spans with their prompts.
+
 ## Layout
 
 ```
@@ -169,10 +236,16 @@ app/
   reviews.py           # pending_reviews queue (Postgres): create / list / get / resolve
   followups.py         # follow_ups queue + "does this thread deserve a nudge?" decision
   notify.py            # deliver an approved reply / follow-up on the customer's channel
-  api.py               # FastAPI: /health, /chat, /reviews, /reviews/{id}, /reviews/{id}/decision
+  inbound.py           # one turn + the side effects every channel shares (review queue, nudge)
+  api.py               # FastAPI: /health, /chat, /chat/{id}/messages, /reviews*, /widget, webhooks
   channels/
-    telegram_bot.py    # Telegram long-polling worker (+ /start, /reset; queues escalations)
+    telegram_bot.py    # Telegram long-polling worker (+ /start, /reset)
+    whatsapp.py        # WhatsApp webhook: verify handshake, parse_inbound(), retry dedup
+  static/
+    widget.js          # embeddable chat widget (Shadow DOM, websocket + HTTP fallback)
+  realtime.py          # Postgres LISTEN/NOTIFY hub -> pushes to open widget sockets
 data/                  # clinic documents (pricing, services, policies, hours)
+clinic-site/           # Next.js clinic website (embeds the widget; content from data/)
 dashboard/             # Next.js approval dashboard (review-queue UI, polls the API)
 supabase/
   migrations/          # SQL migrations for app-owned tables (pending_reviews, …)
@@ -184,6 +257,7 @@ scripts/
   smoke_chat.py        # comprehensive live test harness (real OpenAI + Supabase)
   test_booking.py      # deterministic booking + conflict + reschedule tests (offline)
   test_followups.py    # deterministic follow-up decision tests (offline)
+  test_whatsapp.py     # deterministic webhook parsing + retry-dedup tests (offline)
 ```
 
 ## Roadmap
@@ -195,4 +269,4 @@ scripts/
 - **Step 5** — CRM sync (Airtable / HubSpot free tier)  *(deferred)*
 - ~~**Step 6** — human-in-the-loop escalation + Next.js approval dashboard~~ ✅
 - ~~**Step 7** — scheduled 48h re-engagement follow-ups~~ ✅
-- **Cross-cutting** — web chat widget, WhatsApp channel, LangSmith tracing
+- ~~**Step 8 (cross-cutting)** — web chat widget, WhatsApp channel, LangSmith tracing~~ ✅

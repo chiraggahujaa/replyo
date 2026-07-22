@@ -102,6 +102,9 @@ def _stub_llm():
             if schema is TriageResult:
                 return FS(TriageResult(intent="booking_request"))
             return FS(BookingExtraction(name="Asha", preferred_time="Saturday 3pm", contact="98450 00000"))
+        # _reply() tags the model so the websocket can allow-list streamable tokens;
+        # the stub mirrors that part of the Runnable interface.
+        def with_config(s, **kwargs): return s
         def invoke(s, m): return AIMessage(content="ok")
 
     nodes.get_chat_model = lambda temperature=0.0: FM()

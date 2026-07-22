@@ -33,6 +33,21 @@ class Settings(BaseSettings):
     # IANA timezone for appointment times.
     clinic_timezone: str = "Asia/Kolkata"
 
+    # --- WhatsApp (Meta Cloud API) ---
+    # Leave blank to disable the channel entirely — the API and Telegram bot still
+    # run fine (same pattern as the Google Calendar fallback).
+    # `verify_token` is a string you invent; you type the same one into the Meta app
+    # when registering the webhook, and Meta echoes it back on the verification GET.
+    whatsapp_verify_token: str = ""
+    whatsapp_access_token: str = ""
+    whatsapp_phone_number_id: str = ""
+    # Graph API version used for the send endpoint.
+    whatsapp_api_version: str = "v21.0"
+
+    @property
+    def whatsapp_enabled(self) -> bool:
+        return bool(self.whatsapp_access_token and self.whatsapp_phone_number_id)
+
     # --- Step 7: scheduled re-engagement follow-ups ---
     # How long after a patient's LAST message we nudge them if they never converted.
     # A float so it can be set to e.g. 0.001 to test the worker without waiting 2 days.
@@ -41,9 +56,16 @@ class Settings(BaseSettings):
     followup_max_sends: int = 1
 
     # --- Optional LangSmith tracing ---
-    langsmith_tracing: bool = False
+    langsmith_tracing: bool = True
     langsmith_api_key: str = ""
     langsmith_project: str = "replyo"
+    # Workspace (tenant) the traces belong to. An org-scoped key authenticates fine
+    # but is REFUSED (403) on workspace-scoped resources — projects and run ingestion
+    # — unless the workspace is named. Symptom without it: the app looks correctly
+    # configured, `tracing_is_enabled()` is True, and the logs quietly repeat
+    # "Failed to multipart ingest runs ... 403 Forbidden" while LangSmith stays empty.
+    # Find it in LangSmith -> Settings -> Workspaces, or via GET /workspaces.
+    langsmith_workspace_id: str = ""
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -63,6 +85,10 @@ class Settings(BaseSettings):
             os.environ["LANGSMITH_TRACING"] = "true"
             os.environ["LANGSMITH_API_KEY"] = self.langsmith_api_key
             os.environ["LANGSMITH_PROJECT"] = self.langsmith_project
+            if self.langsmith_workspace_id:
+                # The SDK turns this into the X-Tenant-Id header; without it,
+                # run ingestion is rejected with 403 Forbidden.
+                os.environ["LANGSMITH_WORKSPACE_ID"] = self.langsmith_workspace_id
 
 
 @lru_cache

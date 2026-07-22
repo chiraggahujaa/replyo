@@ -1,0 +1,75 @@
+@import "tailwindcss";
+
+/* ---- Design tokens -------------------------------------------------------
+   A calm, clinical palette: deep teal for trust, warm off-white for the page,
+   and a single sand accent so pricing/CTA blocks lift off the background
+   without shouting. Deliberately light-only — a clinic site reads as clean and
+   bright, and a half-considered dark mode would be worse than none.          */
+:root {
+  --bg: #fbfaf8;
+  --surface: #ffffff;
+  --surface-2: #f4f6f6;
+  --border: #e7e6e1;
+  --border-strong: #d6d8d4;
+  --ink: #16211f;
+  --muted: #55645f;
+  --faint: #8a9793;
+  --accent: #0f766e;
+  --accent-soft: #14b8a6;
+  --accent-wash: #eef7f5;
+  --sand: #f6efe6;
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
+  --color-ink: var(--ink);
+  --color-muted: var(--muted);
+  --color-faint: var(--faint);
+  --color-accent: var(--accent);
+  --color-accent-soft: var(--accent-soft);
+  --color-accent-wash: var(--accent-wash);
+  --color-sand: var(--sand);
+  --font-sans: var(--font-geist-sans);
+  --font-display: var(--font-fraunces);
+}
+
+* {
+  border-color: var(--border);
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  background: var(--bg);
+  color: var(--ink);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--accent-soft) 28%, transparent);
+}
+
+/* Headings use the display serif for a warmer, less corporate feel. */
+.display {
+  font-family: var(--font-fraunces), Georgia, serif;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+@keyframes rise {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.rise { animation: rise 0.55s cubic-bezier(0.16, 1, 0.3, 1) both; }
+
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  .rise { animation: none; }
+}

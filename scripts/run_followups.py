@@ -22,7 +22,7 @@ import logging
 
 from langchain_core.messages import AIMessage, SystemMessage
 
-from app import followups
+from app import followups, realtime
 from app.graph.build import graph_with_checkpointer
 from app.graph.nodes import PERSONA
 from app.llm import get_chat_model
@@ -73,6 +73,9 @@ async def process(graph, row: dict, *, dry_run: bool) -> bool:
     # Deliver first; only record it as sent once it's actually gone out, so a
     # transient send failure is retried on the next run rather than silently lost.
     await send_to_channel(row["channel"], row.get("chat_id"), text)
+    # This worker is a different process from the API that holds the widget sockets,
+    # so the nudge goes out over Postgres NOTIFY — the API relays it to any open one.
+    await realtime.publish_message(thread_id, text, source="followup")
     # Keep the transcript coherent: the nudge becomes part of the conversation.
     await graph.aupdate_state(
         {"configurable": {"thread_id": thread_id}}, {"messages": [AIMessage(content=text)]}

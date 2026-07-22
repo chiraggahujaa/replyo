@@ -23,10 +23,9 @@ from telegram.ext import (
     filters,
 )
 
-from app import followups
 from app.config import settings
-from app.graph.build import graph_with_checkpointer, run_turn
-from app.reviews import create_review
+from app.graph.build import graph_with_checkpointer
+from app.inbound import handle_inbound
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -67,24 +66,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     text = update.message.text
 
     # The compiled graph is stashed on bot_data at startup (see main()).
+    # handle_inbound also queues an escalated reply for approval and arms the
+    # re-engagement nudge, so this handler only has to send the reply.
     graph = context.bot_data["graph"]
-    result = await run_turn(graph, thread_id, text)
+    result = await handle_inbound(
+        graph, thread_id=thread_id, channel="telegram", chat_id=str(chat_id), text=text
+    )
 
     logger.info("chat=%s intent=%s held=%s", chat_id, result["intent"], result.get("held"))
     await update.message.reply_text(result["reply"])
-
-    # If escalated, queue it for the human-approval dashboard.
-    if result.get("held"):
-        review_id = await create_review(
-            thread_id=thread_id, channel="telegram", chat_id=str(chat_id), review=result["review"]
-        )
-        logger.info("queued review %s for chat=%s", review_id, chat_id)
-
-    # Arm (or clear) the 48h re-engagement nudge for this conversation.
-    reason = await followups.record_turn(
-        thread_id=thread_id, channel="telegram", chat_id=str(chat_id), result=result
-    )
-    logger.info("follow-up for chat=%s: %s", chat_id, reason or "cancelled/none")
 
 
 async def _post_init(application: Application) -> None:

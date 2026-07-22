@@ -43,9 +43,25 @@ figures or availability, say you'll confirm and offer to take their details.
 Keep replies to a few sentences."""
 
 
+# Marks the ONE kind of LLM call whose tokens may be streamed to a customer.
+#
+# This matters more than it looks. Every node also makes structured-output calls
+# (triage, slot extraction, and the complaint handler), and those stream their raw
+# JSON as content. Streaming indiscriminately would send a customer `{"intent":...}`
+# — and, far worse, the complaint handler's JSON contains `suggested_reply`, the
+# draft that is supposed to be withheld pending human approval. Tagging the single
+# customer-facing helper means the websocket can allow-list by tag and structured
+# output can never leak. See `REPLY_TAG` use in app/graph/build.py.
+REPLY_TAG = "customer_reply"
+
+
 def _reply(state: ConversationState, instructions: str, temperature: float = 0.4) -> AIMessage:
-    """Shared helper: prepend a system prompt and ask the model for one reply."""
-    model = get_chat_model(temperature=temperature)
+    """Shared helper: prepend a system prompt and ask the model for one reply.
+
+    Every customer-facing sentence in the app goes through here, which is what makes
+    REPLY_TAG a reliable allow-list for streaming.
+    """
+    model = get_chat_model(temperature=temperature).with_config(tags=[REPLY_TAG])
     system = SystemMessage(content=f"{PERSONA}\n\n{instructions}")
     return model.invoke([system, *state["messages"]])  # type: ignore[return-value]
 
