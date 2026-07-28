@@ -24,9 +24,9 @@ from langchain_core.messages import AIMessage, SystemMessage
 
 from app import followups, realtime
 from app.graph.build import graph_with_checkpointer
-from app.graph.nodes import PERSONA
 from app.llm import get_chat_model
 from app.notify import send_to_channel
+from app.tenancy import get_tenant
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -35,8 +35,8 @@ logging.basicConfig(
 logger = logging.getLogger("replyo.followups.worker")
 
 
-async def compose(graph, row: dict) -> str | None:
-    """Write the nudge from the thread's own conversation history."""
+async def compose(graph, row: dict, persona: str) -> str | None:
+    """Write the nudge from the thread's own history, in the persona's voice."""
     config = {"configurable": {"thread_id": row["thread_id"]}}
     snapshot = await graph.aget_state(config)
     messages = (snapshot.values or {}).get("messages", [])
@@ -46,12 +46,12 @@ async def compose(graph, row: dict) -> str | None:
 
     system = SystemMessage(
         content=(
-            f"{PERSONA}\n\n"
-            "This conversation went quiet a while ago and never reached a booking. "
+            f"{persona}\n\n"
+            "This conversation went quiet a while ago and never converted. "
             f"Context: {row.get('reason') or 'they enquired but did not book'}.\n"
             "Write ONE short, warm message (1–2 sentences) checking back in. Reference what "
-            "they were actually interested in, and offer a clear next step such as booking a "
-            "visit. Do NOT invent prices, availability, or claim anything was already booked. "
+            "they were actually interested in, and offer a clear next step such as booking. "
+            "Do NOT invent prices, availability, or claim anything was already booked. "
             "Don't over-apologise and don't sound automated."
         )
     )
@@ -62,7 +62,10 @@ async def compose(graph, row: dict) -> str | None:
 async def process(graph, row: dict, *, dry_run: bool) -> bool:
     """Compose + deliver one nudge. Returns True if it was actually sent."""
     thread_id = row["thread_id"]
-    text = await compose(graph, row)
+    # Each due row can belong to a different persona; nudge in that persona's voice.
+    tenant = await get_tenant(str(row["tenant_id"]))
+    persona = (tenant or {}).get("system_prompt") or "You are a friendly assistant for a business."
+    text = await compose(graph, row, persona)
     if not text:
         return False
 
@@ -80,7 +83,7 @@ async def process(graph, row: dict, *, dry_run: bool) -> bool:
     await graph.aupdate_state(
         {"configurable": {"thread_id": thread_id}}, {"messages": [AIMessage(content=text)]}
     )
-    await followups.mark_sent(thread_id, text)
+    await followups.mark_sent(tenant_id=str(row["tenant_id"]), thread_id=thread_id, message=text)
     logger.info("Sent follow-up to %s (%s)", thread_id, row.get("reason"))
     return True
 

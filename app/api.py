@@ -24,16 +24,25 @@ import logging
 from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from app import realtime, reviews
+from app.admin_api import router as admin_router
 from app.channels.whatsapp import router as whatsapp_router
 from app.graph.build import graph_with_checkpointer, resume_review
-from app.inbound import handle_inbound
+from app.inbound import handle_inbound, scoped_thread
 from app.notify import send_to_channel
+from app.tenancy import (
+    DEMO_TENANT_ID,
+    User,
+    get_current_user,
+    get_tenant,
+    tenant_by_public_key,
+    tenant_for_user,
+)
 
 logger = logging.getLogger("replyo.api")
 
@@ -70,11 +79,27 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+class RevalidatingStaticFiles(StaticFiles):
+    """Static files that must always be revalidated before use.
+
+    The widget is embedded on sites we don't control. With no Cache-Control header a
+    browser applies *heuristic* caching and can serve a stale widget for a long time —
+    so a shipped fix silently never reaches those visitors (and makes local changes look
+    like they "didn't apply"). `no-cache` means "you may store it, but revalidate every
+    time"; paired with the ETag that's a cheap 304 when nothing changed.
+    """
+
+    def file_response(self, *args, **kwargs):
+        resp = super().file_response(*args, **kwargs)
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
+
+
 # The embeddable chat widget. One drop-in script, served cross-origin to any site
 # (the clinic site in clinic-site/ is just another consumer of it).
 app.mount(
     "/widget",
-    StaticFiles(directory=Path(__file__).parent / "static"),
+    RevalidatingStaticFiles(directory=Path(__file__).parent / "static"),
     name="widget",
 )
 
@@ -83,10 +108,17 @@ app.mount(
 # reachable before you ever hold a valid token.
 app.include_router(whatsapp_router)
 
+# Tenant-management API for the dashboard (personas, knowledge, prompt generation).
+# Every route requires a signed-in user; see app/admin_api.py.
+app.include_router(admin_router)
+
 
 class ChatRequest(BaseModel):
     thread_id: str = Field(..., description="Conversation id; reuse it to continue a chat.")
     message: str = Field(..., description="The user's inbound message.")
+    tenant_key: str | None = Field(
+        None, description="The persona's public key (from the widget's data-tenant). Omit to use the demo persona."
+    )
 
 
 class ChatResponse(BaseModel):
@@ -111,7 +143,7 @@ async def health() -> dict:
 
 
 def _channel_for(thread_id: str) -> str:
-    """The embeddable widget uses `web:<uuid>` thread ids; curl/test traffic is `api`.
+    """The embeddable widget uses `web:…` thread ids; curl/test traffic is `api`.
 
     Keeping them distinct means traces and follow-up rows show where a conversation
     actually came from.
@@ -119,15 +151,40 @@ def _channel_for(thread_id: str) -> str:
     return "web" if thread_id.startswith("web:") else "api"
 
 
+async def _resolve_tenant_key(tenant_key: str | None) -> dict:
+    """Public-key -> tenant (the widget path). No key falls back to the demo persona so
+    curl/tests keep working; an unknown key is a hard 404."""
+    if not tenant_key:
+        demo = await get_tenant(DEMO_TENANT_ID)
+        if not demo:
+            raise HTTPException(status_code=500, detail="Demo persona is missing")
+        return demo
+    tenant = await tenant_by_public_key(tenant_key)
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Unknown tenant key")
+    return tenant
+
+
+async def get_active_tenant(
+    user: User = Depends(get_current_user), x_tenant_id: str = Header(..., alias="X-Tenant-Id")
+) -> dict:
+    """Dashboard dependency: the active persona, or 404 unless the user is a member."""
+    return await tenant_for_user(user, x_tenant_id)
+
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest) -> ChatResponse:
-    # chat_id == thread_id: neither channel has an external push target, so replies
-    # held for approval are surfaced by polling /chat/{thread_id}/messages instead.
+    # The thread is scoped to the RESOLVED tenant server-side, so a client can't name
+    # another tenant's conversation. chat_id == thread: neither web nor api has a push
+    # target, so held replies surface by polling /chat/{thread_id}/messages instead.
+    tenant = await _resolve_tenant_key(req.tenant_key)
+    thread = scoped_thread(str(tenant["id"]), req.thread_id)
     result = await handle_inbound(
         app.state.graph,
-        thread_id=req.thread_id,
+        tenant=tenant,
+        thread_id=thread,
         channel=_channel_for(req.thread_id),
-        chat_id=req.thread_id,
+        chat_id=thread,
         text=req.message,
     )
     return ChatResponse(
@@ -153,21 +210,32 @@ async def _transcript(thread_id: str) -> list[dict]:
 
 
 @app.get("/chat/{thread_id}/messages")
-async def chat_messages(thread_id: str) -> dict:
-    """Return the conversation transcript for a thread, straight from the checkpointer.
+async def chat_messages(thread_id: str, tenant_key: str | None = None) -> dict:
+    """Return the conversation transcript for a WEB thread, scoped to its tenant.
 
-    The websocket is the primary transport, but this endpoint is what makes the widget
-    resilient: it restores history on page load and acts as the fallback whenever a
-    socket can't be established. Unknown threads return an empty list rather than 404 —
-    a brand-new visitor simply has no history yet.
+    The websocket is the primary transport; this endpoint restores history on page load
+    and is the fallback when a socket can't be opened. Two guards make it safe in a
+    multi-tenant world (the checkpointer bypasses RLS, so the endpoint must scope itself):
+      - `web:` only — Telegram/WhatsApp thread ids (`whatsapp:<phone>` etc.) are
+        enumerable; the transcript API is a web-widget feature and never serves them.
+      - the thread is scoped to the tenant resolved from `tenant_key`, so one persona's
+        key can never read another persona's conversations. Within a persona, the random
+        `web:<uuid>` is the visitor's own capability (like an unguessable link).
+    Unknown threads return an empty list — a brand-new visitor simply has no history yet.
     """
-    messages = await _transcript(thread_id)
+    if not thread_id.startswith("web:"):
+        raise HTTPException(status_code=404, detail="Not found")
+    tenant = await _resolve_tenant_key(tenant_key)
+    messages = await _transcript(scoped_thread(str(tenant["id"]), thread_id))
     return {"messages": messages, "count": len(messages)}
 
 
 @app.websocket("/ws/chat/{thread_id}")
-async def ws_chat(ws: WebSocket, thread_id: str) -> None:
+async def ws_chat(ws: WebSocket, thread_id: str, tenant_key: str | None = None) -> None:
     """Live chat socket for the embeddable widget.
+
+    Connect with the persona's public key as a query param:
+        /ws/chat/<thread_id>?tenant_key=pk_...
 
     client -> server:  {"type": "user_message", "text": "..."}
     server -> client:  sync | typing | token | message | error
@@ -181,9 +249,20 @@ async def ws_chat(ws: WebSocket, thread_id: str) -> None:
     48h nudge from the worker process) arrive on this same socket.
     """
     await ws.accept()
-    realtime.hub.register(thread_id, ws)
     try:
-        await ws.send_json({"type": "sync", "messages": await _transcript(thread_id)})
+        tenant = await _resolve_tenant_key(tenant_key)
+    except HTTPException:
+        await ws.send_json({"type": "error", "message": "Unknown tenant."})
+        await ws.close()
+        return
+
+    # Scope the thread to the resolved tenant so the socket, the checkpointer, the review
+    # queue and the realtime hub all key on the same tenant-bound id (finding: otherwise a
+    # client could sync/resume another tenant's conversation).
+    thread = scoped_thread(str(tenant["id"]), thread_id)
+    realtime.hub.register(thread, ws)
+    try:
+        await ws.send_json({"type": "sync", "messages": await _transcript(thread)})
 
         while True:
             data = await ws.receive_json()
@@ -201,9 +280,10 @@ async def ws_chat(ws: WebSocket, thread_id: str) -> None:
             try:
                 result = await handle_inbound(
                     app.state.graph,
-                    thread_id=thread_id,
+                    tenant=tenant,
+                    thread_id=thread,
                     channel="web",
-                    chat_id=thread_id,
+                    chat_id=thread,
                     text=text,
                     on_token=on_token,
                 )
@@ -226,27 +306,32 @@ async def ws_chat(ws: WebSocket, thread_id: str) -> None:
     except WebSocketDisconnect:
         pass
     except Exception:
-        logger.exception("Websocket closed unexpectedly for %s", thread_id)
+        logger.exception("Websocket closed unexpectedly for %s", thread)
     finally:
-        realtime.hub.unregister(thread_id, ws)
+        realtime.hub.unregister(thread, ws)
 
 
 @app.get("/reviews")
-async def list_reviews() -> list[dict]:
-    return await reviews.list_pending()
+async def list_reviews(tenant: dict = Depends(get_active_tenant)) -> list[dict]:
+    return await reviews.list_pending(tenant_id=str(tenant["id"]))
 
 
 @app.get("/reviews/{review_id}")
-async def get_review(review_id: str) -> dict:
-    row = await reviews.get_review(review_id)
+async def get_review(review_id: str, tenant: dict = Depends(get_active_tenant)) -> dict:
+    row = await reviews.get_review(review_id, tenant_id=str(tenant["id"]))
     if not row:
         raise HTTPException(status_code=404, detail="Review not found")
     return row
 
 
 @app.post("/reviews/{review_id}/decision")
-async def decide(review_id: str, decision: Decision) -> dict:
-    row = await reviews.get_review(review_id)
+async def decide(
+    review_id: str, decision: Decision, tenant: dict = Depends(get_active_tenant)
+) -> dict:
+    tenant_id = str(tenant["id"])
+    # get_review is tenant-scoped, so a review belonging to another persona is simply
+    # not found — a member of tenant A can never act on tenant B's queue.
+    row = await reviews.get_review(review_id, tenant_id=tenant_id)
     if not row:
         raise HTTPException(status_code=404, detail="Review not found")
     if row["status"] != "pending":
@@ -263,5 +348,5 @@ async def decide(review_id: str, decision: Decision) -> dict:
     # has open (and is in the transcript regardless, for whenever it reconnects).
     await send_to_channel(row["channel"], row.get("chat_id"), final)
     await realtime.publish_message(row["thread_id"], final, source="approval")
-    await reviews.mark_resolved(review_id, decision=decision.action, final_text=final)
+    await reviews.mark_resolved(review_id, tenant_id=tenant_id, decision=decision.action, final_text=final)
     return {"status": "resolved", "final_reply": final}

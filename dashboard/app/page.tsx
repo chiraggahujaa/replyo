@@ -1,16 +1,36 @@
 "use client";
 
+import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { DecisionAction, Review, decideReview, listReviews } from "@/lib/api";
+import { Shell } from "./components/Shell";
+import { useReplyo } from "./providers";
 import { ReviewList } from "./components/ReviewList";
 import { ReviewDetail } from "./components/ReviewDetail";
-import { InboxIcon, SparkIcon } from "./components/icons";
+import { InboxIcon } from "./components/icons";
 
 const POLL_MS = 4000;
-
 type Toast = { id: number; kind: "success" | "error"; text: string };
 
 export default function Home() {
+  return (
+    <Shell>
+      <QueueForActive />
+    </Shell>
+  );
+}
+
+// Remount the queue on persona switch so its state (loading, list, selection) resets
+// cleanly without a reset effect.
+function QueueForActive() {
+  const { active } = useReplyo();
+  if (!active) return <NoPersona />;
+  return <Queue key={active.id} active={active} />;
+}
+
+function Queue({ active }: { active: NonNullable<ReturnType<typeof useReplyo>["active"]> }) {
+  const tenantId = active.id;
+
   const [reviews, setReviews] = useState<Review[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -24,14 +44,11 @@ export default function Home() {
     setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 3800);
   }, []);
 
-  // Poll the review queue. Each tick only touches state after an `await`, so it
-  // never triggers a synchronous cascading render; a cancel flag drops results
-  // that land after unmount.
   useEffect(() => {
     let cancelled = false;
     async function tick() {
       try {
-        const data = await listReviews();
+        const data = await listReviews(tenantId);
         if (cancelled) return;
         setConnected(true);
         setReviews(data);
@@ -48,7 +65,7 @@ export default function Home() {
       cancelled = true;
       clearInterval(t);
     };
-  }, []);
+  }, [tenantId]);
 
   const handleResolved = useCallback(
     (id: string, action: DecisionAction) => {
@@ -57,13 +74,10 @@ export default function Home() {
         setSelectedId((cur) => (cur === id ? next[0]?.id ?? null : cur));
         return next;
       });
-      const label =
-        action === "approve"
-          ? "Reply approved & sent"
-          : action === "edit"
-            ? "Edited reply sent"
-            : "Escalated — handoff sent";
-      pushToast("success", label);
+      pushToast(
+        "success",
+        action === "approve" ? "Reply approved & sent" : action === "edit" ? "Edited reply sent" : "Escalated — handoff sent",
+      );
     },
     [pushToast],
   );
@@ -72,16 +86,10 @@ export default function Home() {
 
   return (
     <div className="flex flex-1 flex-col min-h-0">
-      {/* Header */}
       <header className="sticky top-0 z-10 flex items-center justify-between border-b border-[var(--color-border)] bg-[color-mix(in_srgb,var(--color-bg)_82%,transparent)] px-5 py-3 backdrop-blur-xl">
-        <div className="flex items-center gap-2.5">
-          <div className="grid h-8 w-8 place-items-center rounded-xl bg-gradient-to-br from-indigo-500 to-violet-500 text-white shadow-sm">
-            <SparkIcon className="w-[18px] h-[18px]" />
-          </div>
-          <div className="leading-tight">
-            <div className="text-[14px] font-semibold tracking-tight">Replyo</div>
-            <div className="text-[11px] text-[var(--color-faint)]">Human review queue</div>
-          </div>
+        <div>
+          <div className="text-[14px] font-semibold tracking-tight">Review queue</div>
+          <div className="text-[11px] text-[var(--color-faint)]">{active.name}</div>
         </div>
         <div className="flex items-center gap-3">
           <span className="inline-flex items-center gap-1.5 text-[11px] font-medium text-[var(--color-muted)]">
@@ -94,13 +102,9 @@ export default function Home() {
         </div>
       </header>
 
-      {/* Body */}
       <div className="flex flex-1 min-h-0">
-        {/* Queue */}
         <aside className="w-[340px] shrink-0 border-r border-[var(--color-border)] bg-[var(--color-bg-soft)] overflow-y-auto">
-          <div className="px-4 pt-4 pb-1 text-[11px] font-semibold uppercase tracking-wider text-[var(--color-faint)]">
-            Pending
-          </div>
+          <div className="px-4 pt-4 pb-1 text-[11px] font-semibold uppercase tracking-wider text-[var(--color-faint)]">Pending</div>
           {loading ? (
             <div className="p-6 text-[13px] text-[var(--color-faint)]">Loading…</div>
           ) : reviews.length === 0 ? (
@@ -110,7 +114,6 @@ export default function Home() {
           )}
         </aside>
 
-        {/* Detail */}
         <main className="flex flex-1 flex-col min-h-0 bg-[var(--color-bg)]">
           {selected ? (
             <ReviewDetail
@@ -118,7 +121,7 @@ export default function Home() {
               review={selected}
               onResolved={handleResolved}
               onError={(m) => pushToast("error", m)}
-              decide={decideReview}
+              decide={(id, action, text) => decideReview(tenantId!, id, action, text)}
             />
           ) : (
             <EmptyDetail />
@@ -126,7 +129,6 @@ export default function Home() {
         </main>
       </div>
 
-      {/* Toasts */}
       <div className="pointer-events-none fixed bottom-5 left-1/2 z-50 flex -translate-x-1/2 flex-col items-center gap-2">
         {toasts.map((t) => (
           <div
@@ -155,6 +157,28 @@ function EmptyDetail() {
           No conversations need review right now. New escalations appear here automatically.
         </p>
       </div>
+    </div>
+  );
+}
+
+function NoPersona() {
+  return (
+    <div className="flex flex-1 flex-col items-center justify-center gap-4 text-center px-6">
+      <div className="grid h-14 w-14 place-items-center rounded-2xl bg-gradient-to-br from-indigo-500 to-violet-500 text-white shadow">
+        <InboxIcon className="w-7 h-7" />
+      </div>
+      <div>
+        <p className="text-[16px] font-semibold tracking-tight">Create your first persona</p>
+        <p className="mt-1 text-[13px] text-[var(--color-faint)] max-w-sm">
+          A persona is one business&apos;s assistant — its knowledge, its prompt, its own review queue.
+        </p>
+      </div>
+      <Link
+        href="/personas/new"
+        className="rounded-xl bg-[var(--color-accent)] px-5 py-2.5 text-[13.5px] font-semibold text-white hover:opacity-90"
+      >
+        ＋ New persona
+      </Link>
     </div>
   );
 }

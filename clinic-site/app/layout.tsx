@@ -27,6 +27,8 @@ export const metadata: Metadata = {
 // Where the Replyo API lives. Set NEXT_PUBLIC_REPLYO_API in .env.local to point the
 // widget at a deployed backend; defaults to the local dev API.
 const REPLYO_API = process.env.NEXT_PUBLIC_REPLYO_API ?? "http://localhost:8000";
+// The BrightSmile demo persona's public key (seeded by the multitenancy migration).
+const REPLYO_TENANT = process.env.NEXT_PUBLIC_REPLYO_TENANT ?? "pk_demo_brightsmile";
 
 export default function RootLayout({
   children,
@@ -35,7 +37,9 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en" className={`${geistSans.variable} ${fraunces.variable} h-full antialiased`}>
-      <body className="flex min-h-full flex-col font-sans">
+      {/* suppressHydrationWarning: browser extensions inject attributes onto <body>
+          before hydration, which would otherwise flag a benign mismatch. */}
+      <body className="flex min-h-full flex-col font-sans" suppressHydrationWarning>
         <SiteHeader />
         <main className="flex-1">{children}</main>
         <SiteFooter />
@@ -45,7 +49,12 @@ export default function RootLayout({
           by the FastAPI backend and isolates itself in a Shadow DOM, so the same
           tag drops onto any site; nothing about it is Next.js-specific.
         */}
-        <Script src={`${REPLYO_API}/widget/widget.js`} data-api={REPLYO_API} strategy="afterInteractive" />
+        <Script
+          src={`${REPLYO_API}/widget/widget.js`}
+          data-api={REPLYO_API}
+          data-tenant={REPLYO_TENANT}
+          strategy="afterInteractive"
+        />
       </body>
     </html>
   );

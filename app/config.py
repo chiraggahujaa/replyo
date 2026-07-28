@@ -20,6 +20,13 @@ class Settings(BaseSettings):
     # --- Postgres (Supabase) — used by the LangGraph checkpointer ---
     database_url: str
 
+    # --- Supabase Auth (dashboard sign-in; the API verifies the JWTs it issues) ---
+    # supabase_url -> used to fetch the project JWKS for ES256/RS256 tokens.
+    # supabase_jwt_secret -> HS256 shared secret for legacy-signed tokens (optional;
+    # the verifier picks HS256 vs JWKS from each token's `alg` header).
+    supabase_url: str = ""
+    supabase_jwt_secret: str = ""
+
     # --- Telegram ---
     telegram_bot_token: str = ""
 

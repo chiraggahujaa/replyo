@@ -104,19 +104,24 @@ async def graph_with_checkpointer():
         yield build_graph(checkpointer)
 
 
-def _trace_config(thread_id: str, *, channel: str, run_name: str) -> dict:
-    """Build the invoke config, including LangSmith run naming + metadata.
+def _trace_config(thread_id: str, *, channel: str, run_name: str, tenant: dict | None = None) -> dict:
+    """Build the invoke config: checkpointer key, the active persona, and trace metadata.
 
-    `configurable.thread_id` is what the checkpointer keys on; the rest is purely
-    for tracing, so a run is findable in LangSmith by channel or conversation
-    (filter on the `channel:<name>` tag) instead of scrolling anonymous runs.
-    Harmless when tracing is off — LangChain just ignores it.
+    `configurable.thread_id` is what the checkpointer keys on; `configurable.tenant` is
+    how nodes reach the active persona (its system prompt + knowledge collection) — passed
+    here, not in graph state, so an edited prompt takes effect on the next turn instead of
+    being frozen at whatever it was when the thread began. The rest is tracing, so a run is
+    findable in LangSmith by channel/tenant. Harmless when tracing is off.
     """
     return {
-        "configurable": {"thread_id": thread_id},
+        "configurable": {"thread_id": thread_id, "tenant": tenant or {}},
         "run_name": run_name,
-        "tags": [f"channel:{channel}"],
-        "metadata": {"thread_id": thread_id, "channel": channel},
+        "tags": [f"channel:{channel}"] + ([f"tenant:{tenant['id']}"] if tenant and tenant.get("id") else []),
+        "metadata": {
+            "thread_id": thread_id,
+            "channel": channel,
+            "tenant_id": (tenant or {}).get("id"),
+        },
     }
 
 
@@ -149,18 +154,19 @@ def _shape_result(values: dict, interrupts) -> dict:
 
 
 async def run_turn(
-    graph, thread_id: str, text: str, *, channel: str = "api", on_token=None
+    graph, thread_id: str, text: str, *, channel: str = "api", tenant: dict | None = None, on_token=None
 ) -> dict:
     """Run one conversation turn and return {"intent", "reply", ...}.
 
     Shared by every entry point (FastAPI, Telegram, WhatsApp, websocket) so the
     ingest logic lives in exactly one place. `thread_id` selects which persisted
-    conversation to resume; `channel` is trace metadata only. Both extra params are
-    keyword-only, so existing callers and the offline tests work unchanged.
+    conversation to resume; `tenant` is the active persona (its prompt + knowledge);
+    `channel` is trace metadata. All extra params are keyword-only, so existing callers
+    and the offline tests work unchanged (they run under the fallback persona).
 
     Pass `on_token` (an async callable) to stream the reply as it's generated.
     """
-    config = _trace_config(thread_id, channel=channel, run_name=f"replyo:{channel}")
+    config = _trace_config(thread_id, channel=channel, run_name=f"replyo:{channel}", tenant=tenant)
     inputs = {"messages": [HumanMessage(content=text)]}
 
     if on_token is None:

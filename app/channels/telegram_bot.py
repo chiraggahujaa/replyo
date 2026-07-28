@@ -25,7 +25,8 @@ from telegram.ext import (
 
 from app.config import settings
 from app.graph.build import graph_with_checkpointer
-from app.inbound import handle_inbound
+from app.inbound import handle_inbound, scoped_thread
+from app.tenancy import DEMO_TENANT_ID, get_tenant
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -49,7 +50,7 @@ async def handle_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     only way to truly start fresh in a 1:1 bot chat is to delete that thread.
     """
     chat_id = update.effective_chat.id
-    thread_id = f"telegram:{chat_id}"
+    thread_id = scoped_thread(str(context.bot_data["tenant"]["id"]), f"telegram:{chat_id}")
     graph = context.bot_data["graph"]
     await graph.checkpointer.adelete_thread(thread_id)
     logger.info("reset thread %s", thread_id)
@@ -62,15 +63,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     chat_id = update.effective_chat.id
-    thread_id = f"telegram:{chat_id}"
     text = update.message.text
 
     # The compiled graph is stashed on bot_data at startup (see main()).
     # handle_inbound also queues an escalated reply for approval and arms the
     # re-engagement nudge, so this handler only has to send the reply.
     graph = context.bot_data["graph"]
+    # Telegram is single-tenant in phase 1: one bot token -> the demo persona (cached on
+    # bot_data). Scope the thread to that tenant so the checkpointer key is tenant-bound.
+    tenant = context.bot_data["tenant"]
+    thread_id = scoped_thread(str(tenant["id"]), f"telegram:{chat_id}")
     result = await handle_inbound(
-        graph, thread_id=thread_id, channel="telegram", chat_id=str(chat_id), text=text
+        graph, tenant=tenant, thread_id=thread_id, channel="telegram",
+        chat_id=str(chat_id), text=text,
     )
 
     logger.info("chat=%s intent=%s held=%s", chat_id, result["intent"], result.get("held"))
@@ -86,6 +91,7 @@ async def _post_init(application: Application) -> None:
     graph = await cm.__aenter__()
     application.bot_data["graph"] = graph
     application.bot_data["_graph_cm"] = cm
+    application.bot_data["tenant"] = await get_tenant(DEMO_TENANT_ID)
 
 
 async def _post_shutdown(application: Application) -> None:

@@ -28,8 +28,9 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 
 from app.config import settings
-from app.inbound import handle_inbound
+from app.inbound import handle_inbound, scoped_thread
 from app.notify import send_to_channel
+from app.tenancy import DEMO_TENANT_ID, get_tenant
 
 logger = logging.getLogger("replyo.whatsapp")
 
@@ -124,6 +125,7 @@ async def receive(request: Request) -> dict:
         return {"status": "ignored"}
 
     graph = request.app.state.graph
+    tenant = await get_tenant(DEMO_TENANT_ID)  # single-tenant in phase 1
     handled = 0
     for msg in messages:
         if _seen.seen(msg.message_id):
@@ -132,7 +134,8 @@ async def receive(request: Request) -> dict:
         try:
             result = await handle_inbound(
                 graph,
-                thread_id=msg.thread_id,
+                tenant=tenant,
+                thread_id=scoped_thread(str(tenant["id"]), msg.thread_id),
                 channel="whatsapp",
                 chat_id=msg.from_number,
                 text=msg.text,

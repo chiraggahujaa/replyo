@@ -25,21 +25,37 @@
 (function () {
   "use strict";
 
-  const script = document.currentScript;
+  // Single-instance guard. In a single-page app (e.g. the console's Install page) the
+  // widget can be injected repeatedly as the user navigates; tear down any previous
+  // instance first so we never leave a zombie socket/timer running against an old,
+  // detached DOM node. Without this, a fresh instance's sync could race a stale one and
+  // the reconnect transcript wouldn't show.
+  if (window.__replyoWidget && typeof window.__replyoWidget.teardown === "function") {
+    try { window.__replyoWidget.teardown(); } catch (e) { /* ignore */ }
+  }
+
+  // `document.currentScript` is null for dynamically-injected scripts, so fall back to
+  // locating our own tag by src to read data-api / data-tenant.
+  const script = document.currentScript || document.querySelector('script[src*="/widget/widget.js"]');
   const API = (script && script.dataset.api ? script.dataset.api : window.location.origin)
     .replace(/\/$/, "");
   const WS_BASE = API.replace(/^http/, "ws");
-  const STORAGE_KEY = "replyo:thread_id";
+  // Which persona this widget talks to. Set data-tenant="pk_..." on the script tag.
+  const TENANT_KEY = (script && script.dataset.tenant) || "";
+  // Thread + storage are namespaced per persona, so two embeds on one page never share.
+  const STORAGE_KEY = "replyo:thread:" + (TENANT_KEY || "default");
   const POLL_MS = 4000;
   const MAX_BACKOFF = 15000;
 
-  // One stable thread per browser, so a returning visitor keeps their history.
+  // One stable thread per browser + persona, so a returning visitor keeps their history.
   function threadId() {
     let id = localStorage.getItem(STORAGE_KEY);
     if (!id) {
       const uuid = window.crypto && crypto.randomUUID
         ? crypto.randomUUID()
         : String(Date.now()) + Math.random().toString(16).slice(2);
+      // Just a random handle; the server binds it to this persona's tenant, so the
+      // client never needs (or is trusted with) the tenant id in the thread itself.
       id = "web:" + uuid;
       localStorage.setItem(STORAGE_KEY, id);
     }
@@ -152,17 +168,39 @@
   let unread = 0;
   let streamEl = null;   // the bubble currently being streamed into
   let typingEl = null;
+  let destroyed = false; // set by teardown() so the socket never reconnects afterwards
 
   // ---------- rendering ----------
 
   const scroll = () => { els.log.scrollTop = els.log.scrollHeight; };
 
+  // Render a small, safe subset of markdown (**bold**, *italic*) as real DOM nodes.
+  // Crucially this uses textContent for every span and only ever appends <strong>/<em>
+  // elements we create — never innerHTML — so model output still can't inject markup
+  // onto the host page. Bold is matched before italic so ** isn't eaten as two *.
+  function setRich(el, text) {
+    el.textContent = "";
+    const parts = String(text).split(/(\*\*[^*\n]+\*\*|\*[^*\n]+\*)/g);
+    for (const part of parts) {
+      if (!part) continue;
+      const bold = /^\*\*([^*\n]+)\*\*$/.exec(part);
+      const italic = bold ? null : /^\*([^*\n]+)\*$/.exec(part);
+      if (bold || italic) {
+        const node = document.createElement(bold ? "strong" : "em");
+        node.textContent = (bold || italic)[1];
+        el.appendChild(node);
+      } else {
+        el.appendChild(document.createTextNode(part));
+      }
+    }
+  }
+
   function addMessage(role, content) {
     const div = document.createElement("div");
     div.className = "msg " + (role === "human" ? "human" : "ai");
-    // textContent, never innerHTML: replies are model-generated and must never be
-    // interpreted as markup on the host page.
-    div.textContent = content;
+    // Assistant replies may contain **bold**; the customer's own text is shown verbatim.
+    if (role === "ai") setRich(div, content);
+    else div.textContent = content;
     els.log.appendChild(div);
     scroll();
     return div;
@@ -223,10 +261,12 @@
   // ---------- transport: websocket ----------
 
   function connect() {
+    if (destroyed) return;
     if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
     let socket;
     try {
-      socket = new WebSocket(`${WS_BASE}/ws/chat/${encodeURIComponent(THREAD)}`);
+      const q = TENANT_KEY ? `?tenant_key=${encodeURIComponent(TENANT_KEY)}` : "";
+      socket = new WebSocket(`${WS_BASE}/ws/chat/${encodeURIComponent(THREAD)}${q}`);
     } catch (err) {
       startPolling();
       return;
@@ -247,6 +287,7 @@
 
     socket.onclose = () => {
       ws = null;
+      if (destroyed) return; // torn down — don't resurrect
       setStatus(false, "Reconnecting…");
       // Poll while disconnected so nothing is missed, and retry the socket with
       // backoff. Whichever recovers first wins.
@@ -273,8 +314,11 @@
         if (!streamEl) {
           streamEl = addMessage("ai", "");
           streamEl.classList.add("cursor");
+          streamEl._raw = "";
         }
-        streamEl.textContent += msg.text;
+        // Accumulate the raw stream and re-render, so **bold** formats as it arrives.
+        streamEl._raw += msg.text;
+        setRich(streamEl, streamEl._raw);
         scroll();
         break;
 
@@ -282,7 +326,7 @@
         clearTyping();
         if (streamEl) {
           // Replace the streamed preview with the authoritative text.
-          streamEl.textContent = msg.content;
+          setRich(streamEl, msg.content);
           streamEl.classList.remove("cursor");
           streamEl = null;
         } else {
@@ -313,7 +357,8 @@
 
   async function syncOverHttp() {
     try {
-      const res = await fetch(`${API}/chat/${encodeURIComponent(THREAD)}/messages`, { cache: "no-store" });
+      const q = TENANT_KEY ? `?tenant_key=${encodeURIComponent(TENANT_KEY)}` : "";
+      const res = await fetch(`${API}/chat/${encodeURIComponent(THREAD)}/messages${q}`, { cache: "no-store" });
       if (!res.ok) return;
       const data = await res.json();
       if (data.count !== known) {
@@ -325,7 +370,7 @@
   }
 
   function startPolling() {
-    if (pollTimer) return;
+    if (destroyed || pollTimer) return;
     syncOverHttp();
     pollTimer = setInterval(syncOverHttp, POLL_MS);
   }
@@ -334,6 +379,21 @@
     if (pollTimer) clearInterval(pollTimer);
     pollTimer = null;
   }
+
+  // Fully dispose this instance: stop the socket (and its reconnect), clear timers, and
+  // remove the host element. Called by the single-instance guard at the top of the next
+  // load, and by the console's Install page on unmount.
+  function teardown() {
+    destroyed = true;
+    stopPolling();
+    if (ws) {
+      try { ws.onclose = null; ws.onerror = null; ws.close(); } catch (e) { /* ignore */ }
+      ws = null;
+    }
+    try { host.remove(); } catch (e) { /* ignore */ }
+    if (window.__replyoWidget && window.__replyoWidget.host === host) window.__replyoWidget = null;
+  }
+  window.__replyoWidget = { teardown, host, thread: THREAD };
 
   // ---------- sending ----------
 
@@ -353,7 +413,7 @@
       const res = await fetch(`${API}/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ thread_id: THREAD, message: text }),
+        body: JSON.stringify({ thread_id: THREAD, message: text, tenant_key: TENANT_KEY }),
       });
       if (!res.ok) throw new Error("chat " + res.status);
       const data = await res.json();

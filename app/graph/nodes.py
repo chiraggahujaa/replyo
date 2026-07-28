@@ -1,16 +1,21 @@
 """Graph nodes.
 
-Step 2 splits the single responder into intent-specific handlers:
+Intent-specific handlers, one per triage bucket:
 
-  triage            -> classify the latest inbound message into five buckets
+  triage            -> classify the latest inbound message
   qualify           -> (new_lead) slot-fill need/timeline/contact across turns
   respond           -> (existing_customer) general answer
-  handle_booking    -> (booking_request) acknowledge; real calendar comes in Step 4
-  handle_complaint  -> (complaint) empathise + flag needs_human for a person
+  handle_booking    -> (booking_request) book / reschedule on the calendar
+  answer_from_docs  -> (question) RAG over THIS persona's documents, with citations
+  handle_complaint  -> (complaint) apologise now + draft a reply for human approval
   handle_spam       -> (spam) polite, minimal deflection
 
-Each node is a plain function `(state) -> partial_state`. LangGraph routes triage
-to exactly one handler (see build.py) and merges what it returns into the state.
+Multi-tenant note: a node that talks to the customer or retrieves knowledge reads the
+active persona from `config["configurable"]["tenant"]` — the persona's system prompt and
+its pgvector collection. It comes via `config`, NOT graph state, on purpose: state is
+checkpointed per thread, so a persona stored there would freeze at whatever it was on the
+first message; config is rebuilt every turn (see app/graph/build.py). Nodes that need it
+take `(state, config)`; the rest stay `(state)`.
 """
 
 from __future__ import annotations
@@ -21,6 +26,7 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 from langchain_core.messages import AIMessage, SystemMessage
+from langchain_core.runnables import RunnableConfig
 from langgraph.types import interrupt
 from pydantic import BaseModel, Field
 
@@ -29,18 +35,17 @@ from app.calendar import get_calendar
 from app.graph.state import BookingInfo, ConversationState, Intent, LeadInfo
 from app.llm import get_chat_model
 from app.rag import retrieve
+from app.tenancy import DEMO_TENANT_ID
 
 logger = logging.getLogger("replyo.nodes")
 
-# --- Business persona (Step 1 stub; RAG over real docs comes in Step 3) ---
-CLINIC_NAME = "BrightSmile Dental"
-
-PERSONA = f"""You are the friendly front-desk assistant for {CLINIC_NAME}, a dental clinic.
-You help patients and prospects over chat. Be warm, concise, and professional.
-Do NOT invent specific prices, insurance coverage, or open appointment slots — this
-build has no access to the clinic's documents or calendar yet. If asked for exact
-figures or availability, say you'll confirm and offer to take their details.
-Keep replies to a few sentences."""
+# Fallback persona when a turn runs without a configured tenant (offline tests, and a
+# belt-and-braces default). Real traffic always carries the tenant's own system prompt.
+PERSONA = (
+    "You are a warm, concise, professional front-desk assistant for a business. "
+    "Answer only from the information you are given; do not invent specifics. If you are "
+    "unsure, say you'll confirm and offer to take the person's details. Keep replies short."
+)
 
 
 # Marks the ONE kind of LLM call whose tokens may be streamed to a customer.
@@ -55,14 +60,33 @@ Keep replies to a few sentences."""
 REPLY_TAG = "customer_reply"
 
 
-def _reply(state: ConversationState, instructions: str, temperature: float = 0.4) -> AIMessage:
-    """Shared helper: prepend a system prompt and ask the model for one reply.
+# ---- Active persona, read from the invocation config ----
 
-    Every customer-facing sentence in the app goes through here, which is what makes
-    REPLY_TAG a reliable allow-list for streaming.
+def _tenant(config: Optional[RunnableConfig]) -> dict:
+    return ((config or {}).get("configurable") or {}).get("tenant") or {}
+
+
+def _system_prompt(config: Optional[RunnableConfig]) -> str:
+    """This persona's generated instruction, or the generic fallback."""
+    return _tenant(config).get("system_prompt") or PERSONA
+
+
+def _tenant_id(config: Optional[RunnableConfig]) -> str:
+    """Whose knowledge collection to retrieve from."""
+    return _tenant(config).get("id") or DEMO_TENANT_ID
+
+
+def _reply(
+    state: ConversationState, instructions: str, *, config: Optional[RunnableConfig],
+    temperature: float = 0.4,
+) -> AIMessage:
+    """Shared helper: prepend the persona's system prompt and ask for one reply.
+
+    Every customer-facing sentence goes through here — that's what makes REPLY_TAG a
+    reliable streaming allow-list, and what makes the persona swap a one-line change.
     """
     model = get_chat_model(temperature=temperature).with_config(tags=[REPLY_TAG])
-    system = SystemMessage(content=f"{PERSONA}\n\n{instructions}")
+    system = SystemMessage(content=f"{_system_prompt(config)}\n\n{instructions}")
     return model.invoke([system, *state["messages"]])  # type: ignore[return-value]
 
 
@@ -74,10 +98,10 @@ class TriageResult(BaseModel):
     intent: Intent = Field(
         description=(
             "Classification of the latest user message. "
-            "new_lead: a prospective patient expressing interest in becoming a patient or wanting treatment. "
-            "question: a factual question about the clinic answerable from its documents "
-            "(prices, services offered, insurance/policies, opening hours, location). "
-            "existing_customer: a current patient asking about THEIR OWN records, appointment, or account. "
+            "new_lead: a prospective customer expressing interest or wanting a service. "
+            "question: a factual question answerable from the business's documents "
+            "(prices, services, policies, hours, location). "
+            "existing_customer: a current customer asking about THEIR OWN records, appointment, or account. "
             "booking_request: wants to schedule, reschedule, or cancel an appointment. "
             "complaint: unhappy, frustrated, or reporting a problem. "
             "spam: irrelevant, promotional, or nonsensical."
@@ -90,7 +114,7 @@ def triage(state: ConversationState) -> dict:
     model = get_chat_model(temperature=0.0).with_structured_output(TriageResult)
     system = SystemMessage(
         content=(
-            "You are a triage classifier for a dental clinic's inbound messages. "
+            "You are a triage classifier for a business's inbound messages. "
             "Read the conversation and classify the latest user message."
         )
     )
@@ -141,6 +165,7 @@ def _extract_and_merge(
 def _slot_fill_reply(
     state: ConversationState,
     *,
+    config: Optional[RunnableConfig],
     info: dict,
     all_slots: tuple[str, ...],
     required: tuple[str, ...],
@@ -160,7 +185,7 @@ def _slot_fill_reply(
         )
     else:
         instructions = f"{done_intro} Details on file: {known}."
-    return _reply(state, instructions)
+    return _reply(state, instructions, config=config)
 
 
 # ---- Lead qualification ----
@@ -174,20 +199,20 @@ class LeadExtraction(BaseModel):
 
     name: Optional[str] = Field(None, description="The prospect's name, if stated.")
     need: Optional[str] = Field(
-        None, description="The dental concern or treatment they want (e.g. cleaning, implant, pain)."
+        None, description="The concern or service they want (e.g. cleaning, a quote, support)."
     )
     timeline: Optional[str] = Field(
-        None, description="How soon they want care (e.g. this week, next month, ASAP)."
+        None, description="How soon they want it (e.g. this week, next month, ASAP)."
     )
     budget: Optional[str] = Field(
-        None, description="Any budget figure or dental insurance they mention."
+        None, description="Any budget figure or insurance/plan they mention."
     )
     contact: Optional[str] = Field(
         None, description="A phone number or email to follow up on."
     )
 
 
-def qualify(state: ConversationState) -> dict:
+def qualify(state: ConversationState, config: RunnableConfig) -> dict:
     """Progressively qualify a lead: extract slots, then ask for the next gap.
 
     Stateful across turns via the checkpointer, so a lead who answers one question
@@ -200,14 +225,15 @@ def qualify(state: ConversationState) -> dict:
         required=REQUIRED_LEAD_SLOTS,
         prior=state.get("lead_info") or {},
         complete_flag="qualified",
-        extraction_hint="Extract lead-qualification details from the conversation for a dental clinic.",
+        extraction_hint="Extract lead-qualification details from the conversation for a business.",
     )
     ai = _slot_fill_reply(
         state,
+        config=config,
         info=lead,
         all_slots=ALL_LEAD_SLOTS,
         required=REQUIRED_LEAD_SLOTS,
-        ask_intro="This is a prospective patient (a new lead).",
+        ask_intro="This is a prospective customer (a new lead).",
         done_intro=(
             "This lead is now fully qualified. Thank them, briefly recap what you noted, and "
             "let them know a team member will reach out to confirm next steps."
@@ -218,12 +244,13 @@ def qualify(state: ConversationState) -> dict:
 
 # ---- Other intent handlers ----
 
-def respond(state: ConversationState) -> dict:
-    """Existing customer: general helpful answer (RAG grounding arrives in Step 3)."""
+def respond(state: ConversationState, config: RunnableConfig) -> dict:
+    """Existing customer: general helpful answer."""
     ai = _reply(
         state,
-        "This is an existing patient. Answer helpfully. If it needs their records or "
-        "exact policy details you don't have, offer to have the team follow up.",
+        "This is an existing customer. Answer helpfully. If it needs their records or "
+        "exact details you don't have, offer to have the team follow up.",
+        config=config,
     )
     return {"messages": [ai]}
 
@@ -235,7 +262,7 @@ ALL_BOOKING_SLOTS = ("name", "preferred_time", "contact")
 class BookingExtraction(BaseModel):
     """Appointment-request details pulled from the conversation. None = not stated."""
 
-    name: Optional[str] = Field(None, description="The patient's name for the appointment.")
+    name: Optional[str] = Field(None, description="The customer's name for the appointment.")
     preferred_time: Optional[str] = Field(
         None, description="Requested day and/or time, e.g. 'Saturday 3pm', 'next Tuesday morning'."
     )
@@ -244,11 +271,13 @@ class BookingExtraction(BaseModel):
     )
 
 
-def _apply_confirmation(state: ConversationState, booking: dict, result: dict) -> AIMessage:
+def _apply_confirmation(
+    state: ConversationState, booking: dict, result: dict, config: Optional[RunnableConfig]
+) -> AIMessage:
     """Record a confirmed slot on `booking` and craft the reply.
 
     If this is the tail of a reschedule (a `reschedule_from_event_id` marker is set),
-    release the old event so the patient isn't left double-booked, and phrase the reply
+    release the old event so the customer isn't left double-booked, and phrase the reply
     as a move rather than a fresh booking.
     """
     new_event = result["event_id"]
@@ -279,11 +308,13 @@ def _apply_confirmation(state: ConversationState, booking: dict, result: dict) -
             f"Their appointment is CONFIRMED for {booking['confirmed_time']} under {name}. "
             "Confirm it warmly and say they'll get a reminder."
         )
-    return _reply(state, instructions)
+    return _reply(state, instructions, config=config)
 
 
-def _offer_alternatives(state: ConversationState, booking: dict, result: dict) -> AIMessage:
-    """Record the offered alternatives on a conflict and ask the patient to pick one."""
+def _offer_alternatives(
+    state: ConversationState, booking: dict, result: dict, config: Optional[RunnableConfig]
+) -> AIMessage:
+    """Record the offered alternatives on a conflict and ask the customer to pick one."""
     alts = [format_slot(s) for s in result["alternatives"]]
     booking["status"] = "conflict"
     booking["alternatives"] = alts
@@ -291,14 +322,19 @@ def _offer_alternatives(state: ConversationState, booking: dict, result: dict) -
     offered = "; ".join(alts) if alts else "no nearby slots"
     return _reply(
         state,
-        f"The requested time ({format_slot(result['requested'])}) is already taken. Apologise "
-        f"briefly and offer these available slots: {offered}. Ask them to pick one. Do NOT ask "
-        "for their name or contact — you already have them.",
+        f"Their preferred time isn't available. Apologise briefly that you couldn't get them in then "
+        f"and offer these available times: {offered}. Ask them to pick one. IMPORTANT: do NOT state "
+        "or invent a specific clock time as 'taken' unless the customer explicitly named that exact "
+        "time — when they only gave a vague window (e.g. 'morning'), just present the options. Do NOT "
+        "ask for their name or contact — you already have them.",
+        config=config,
     )
 
 
-def _confirmed_ack_reply(state: ConversationState, booking: dict) -> AIMessage:
-    """Reply when a patient with a confirmed booking writes but proposes no new time."""
+def _confirmed_ack_reply(
+    state: ConversationState, booking: dict, config: Optional[RunnableConfig]
+) -> AIMessage:
+    """Reply when a customer with a confirmed booking writes but proposes no new time."""
     return _reply(
         state,
         f"They already have a CONFIRMED appointment for {booking.get('confirmed_time')} under "
@@ -306,6 +342,7 @@ def _confirmed_ack_reply(state: ConversationState, booking: dict) -> AIMessage:
         "If they want to change it, ask for the specific new day and time they'd like; if they want "
         "to cancel, tell them our team will take care of it. Do NOT ask for their name or contact "
         "again, and NEVER claim you can't see previous messages or that you'll 'check and get back'.",
+        config=config,
     )
 
 
@@ -322,7 +359,7 @@ def _reschedule_target(
     current = booking.get("confirmed_time") or "their current appointment"
     latest = _latest_user_text(state)
     context = (
-        f"The patient already has a CONFIRMED dental appointment on {current}. They just sent "
+        f"The customer already has a CONFIRMED appointment on {current}. They just sent "
         f"this message: {latest!r}. If they are asking to move/reschedule to a specific new time, "
         "extract that NEW day and time; if they give a new time but not a new day, use the SAME "
         "DAY as the current appointment. If they are NOT proposing a specific new time (just "
@@ -340,7 +377,7 @@ def _reschedule_target(
     return target
 
 
-def handle_booking(state: ConversationState) -> dict:
+def handle_booking(state: ConversationState, config: RunnableConfig) -> dict:
     """Book, reschedule, or keep collecting details for an appointment.
 
     - collecting: slot-fill name + preferred_time + contact (can't book until all present).
@@ -349,7 +386,7 @@ def handle_booking(state: ConversationState) -> dict:
       slot); otherwise just acknowledge — reusing the name/contact already on file so we never
       re-ask or pretend we can't see the history.
 
-    On a conflict the patient's next message (their pick) re-enters here and re-books; if a
+    On a conflict the customer's next message (their pick) re-enters here and re-books; if a
     reschedule hit a conflict, the pending old-event marker rides along so the pick still
     releases the original slot.
     """
@@ -360,7 +397,7 @@ def handle_booking(state: ConversationState) -> dict:
         required=REQUIRED_BOOKING_SLOTS,
         prior=state.get("booking_info") or {},
         complete_flag="ready",
-        extraction_hint="Extract appointment-booking details from the conversation for a dental clinic.",
+        extraction_hint="Extract appointment-booking details from the conversation for a business.",
     )
 
     tz = clinic_tz()
@@ -370,16 +407,16 @@ def handle_booking(state: ConversationState) -> dict:
     if booking.get("status") == "confirmed":
         target = _reschedule_target(state, booking, now=now, tz=tz)
         if target is None:
-            return {"booking_info": booking, "messages": [_confirmed_ack_reply(state, booking)]}
+            return {"booking_info": booking, "messages": [_confirmed_ack_reply(state, booking, config)]}
         booking["reschedule_from_event_id"] = booking.get("event_id")
         result = reserve_slot(booking, get_calendar(), target, now=now, tz=tz)
         if result["status"] == "confirmed":
-            ai = _apply_confirmation(state, booking, result)
+            ai = _apply_confirmation(state, booking, result, config)
         elif result["status"] == "conflict":
-            ai = _offer_alternatives(state, booking, result)
+            ai = _offer_alternatives(state, booking, result, config)
         else:  # couldn't place the new time -> keep the existing booking, just acknowledge
             booking.pop("reschedule_from_event_id", None)
-            ai = _confirmed_ack_reply(state, booking)
+            ai = _confirmed_ack_reply(state, booking, config)
         return {"booking_info": booking, "messages": [ai]}
 
     # Phase 1: still missing a required slot -> keep collecting.
@@ -387,6 +424,7 @@ def handle_booking(state: ConversationState) -> dict:
         booking["status"] = "collecting"
         ai = _slot_fill_reply(
             state,
+            config=config,
             info=booking,
             all_slots=ALL_BOOKING_SLOTS,
             required=REQUIRED_BOOKING_SLOTS,
@@ -405,15 +443,16 @@ def handle_booking(state: ConversationState) -> dict:
     result = try_book(booking, get_calendar(), time_text)
 
     if result["status"] == "confirmed":
-        ai = _apply_confirmation(state, booking, result)
+        ai = _apply_confirmation(state, booking, result, config)
     elif result["status"] == "conflict":
-        ai = _offer_alternatives(state, booking, result)
+        ai = _offer_alternatives(state, booking, result, config)
     else:  # need_time
         booking["status"] = "collecting"
         ai = _reply(
             state,
             "You couldn't work out a concrete appointment time from their message. Politely ask "
             "them to give a specific day and time within opening hours (Mon–Sat 9:30am–8pm, Sun 10am–2pm).",
+            config=config,
         )
 
     return {"booking_info": booking, "messages": [ai]}
@@ -440,7 +479,7 @@ class ComplaintReplies(BaseModel):
     )
 
 
-def handle_complaint(state: ConversationState) -> dict:
+def handle_complaint(state: ConversationState, config: RunnableConfig) -> dict:
     """Complaint: apologise now, and draft a suggested reply for a human to approve.
 
     Produces two things in one LLM call:
@@ -453,8 +492,8 @@ def handle_complaint(state: ConversationState) -> dict:
     model = get_chat_model(temperature=0.4).with_structured_output(ComplaintReplies)
     system = SystemMessage(
         content=(
-            f"{PERSONA}\n\nThe latest message is a complaint from a patient. Draft the two "
-            "replies described by the schema. Be genuinely empathetic; never blame the patient."
+            f"{_system_prompt(config)}\n\nThe latest message is a complaint from a customer. Draft "
+            "the two replies described by the schema. Be genuinely empathetic; never blame the customer."
         )
     )
     replies: ComplaintReplies = model.invoke([system, *state["messages"]])  # type: ignore[assignment]
@@ -508,29 +547,25 @@ def human_review(state: ConversationState) -> dict:
     return {"messages": [AIMessage(content=final)], "needs_human": True}
 
 
-def handle_spam(state: ConversationState) -> dict:
+def handle_spam(state: ConversationState, config: RunnableConfig) -> dict:
     """Spam: keep it short and polite; don't engage the content."""
     ai = _reply(
         state,
-        "This message looks like spam or is unrelated to the clinic. Reply with a brief, "
-        "polite note that you can only help with dental enquiries.",
+        "This message looks like spam or is unrelated to the business. Reply with a brief, "
+        "polite note that you can only help with enquiries about the business.",
+        config=config,
         temperature=0.2,
     )
     return {"messages": [ai]}
 
 
-# ---- RAG: answer factual questions from the clinic's documents (Step 3) ----
+# ---- RAG: answer factual questions from THIS persona's documents ----
 
 RETRIEVAL_K = 4
 # Cosine distance cut-off (lower = more similar). This is a coarse PRE-FILTER, not
-# the main safety net: it only drops clearly-unrelated queries (car engine ~0.80,
-# weather ~0.85) so we don't waste an LLM call on them. The real anti-hallucination
-# guard is the grounding prompt below, which declines when the specific answer
-# isn't in the retrieved text.
-# Tuned against the actual data (scripts/smoke_chat.py + the distance probe): real
-# in-domain questions land ~0.43–0.73 (e.g. "where are you located?" ≈ 0.73), so
-# anything below ~0.5 caused false refusals. 0.76 clears every legit question while
-# still filtering the 0.80+ off-topic ones.
+# the main safety net: it only drops clearly-unrelated queries so we don't waste an
+# LLM call on them. The real anti-hallucination guard is the grounding prompt below,
+# which declines when the specific answer isn't in the retrieved text.
 MAX_DISTANCE = 0.76
 
 REFUSAL = (
@@ -547,8 +582,8 @@ def _latest_user_text(state: ConversationState) -> str:
     return ""
 
 
-def answer_from_docs(state: ConversationState) -> dict:
-    """Retrieve relevant chunks and answer ONLY from them, with citations.
+def answer_from_docs(state: ConversationState, config: RunnableConfig) -> dict:
+    """Retrieve relevant chunks from this persona's collection and answer ONLY from them.
 
     Two guardrails against hallucination:
       1. Relevance gate — if nothing retrieved is within MAX_DISTANCE, we refuse
@@ -557,7 +592,7 @@ def answer_from_docs(state: ConversationState) -> dict:
          context and to say it doesn't know rather than invent prices/policies.
     """
     query = _latest_user_text(state)
-    hits = retrieve(query, k=RETRIEVAL_K)
+    hits = retrieve(query, tenant_id=_tenant_id(config), k=RETRIEVAL_K)
     relevant = [(doc, dist) for doc, dist in hits if dist <= MAX_DISTANCE]
 
     # Guard 1: nothing relevant -> refuse, don't hallucinate.
@@ -576,13 +611,13 @@ def answer_from_docs(state: ConversationState) -> dict:
 
     # Guard 2: grounding instructions.
     instructions = (
-        "Answer the patient's question USING ONLY the context below. If the answer is not "
+        "Answer the customer's question USING ONLY the context below. If the answer is not "
         "clearly in the context, say you don't have that information on hand and offer to "
         "have the team follow up — do NOT guess or invent prices, policies, or availability. "
         "Cite the sources you used inline like [1], [2]. Keep it concise.\n\n"
         f"Context:\n{context}"
     )
-    ai = _reply(state, instructions, temperature=0.1)
+    ai = _reply(state, instructions, config=config, temperature=0.1)
 
     # Append a human-friendly Sources footer so it shows in any channel.
     reply = f"{ai.content}\n\nSources: {', '.join(sources)}"

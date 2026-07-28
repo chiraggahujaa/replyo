@@ -22,10 +22,14 @@ dependencies = [
     # Config
     "pydantic-settings>=2.5",
     "python-dotenv>=1.0",
+    # Multi-tenancy: verify Supabase-issued JWTs; crawl + extract websites for RAG
+    "pyjwt[crypto]>=2.9",
+    "beautifulsoup4>=4.12",
     "langchain-postgres>=0.0.17",
     "langchain-text-splitters>=1.1.2",
     "google-api-python-client>=2.198.0",
     "google-auth>=2.56.0",
+    "python-multipart>=0.0.32",
 ]
 
 [project.optional-dependencies]

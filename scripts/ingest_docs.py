@@ -1,8 +1,11 @@
-"""Ingest the clinic's documents into pgvector.
+"""Ingest the demo persona's documents into its pgvector collection.
 
-Reads every `*.md` file in `data/`, splits each into overlapping chunks, embeds
-them, and writes them to the `clinic_docs` collection on Supabase. Re-running is
-safe — it wipes and rebuilds the collection so you never get duplicate chunks.
+Reads every `*.md` in `data/`, splits each into overlapping chunks, embeds them, and
+writes them to the DEMO tenant's collection — the seed persona that the clinic-site and
+the single-tenant channels use. Re-running is safe: it wipes and rebuilds the collection.
+
+Real personas ingest through the dashboard (uploads + website crawl, see app/knowledge.py);
+this script is the local-dev seed path for the built-in demo.
 
 Run:  uv run python scripts/ingest_docs.py
 """
@@ -14,7 +17,9 @@ from pathlib import Path
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-from app.rag import COLLECTION_NAME, build_store
+from app.knowledge import CHUNK_OVERLAP, CHUNK_SIZE
+from app.rag import build_store, collection_name
+from app.tenancy import DEMO_TENANT_ID
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 
@@ -24,8 +29,7 @@ def main() -> None:
     if not files:
         raise SystemExit(f"No .md files found in {DATA_DIR}")
 
-    # Chunk so each piece is small enough to be a precise citation but keeps context.
-    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
+    splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
 
     docs: list[Document] = []
     for path in files:
@@ -34,10 +38,11 @@ def main() -> None:
             # `source` is what we cite back to the user.
             docs.append(Document(page_content=chunk, metadata={"source": path.name}))
 
-    print(f"Loaded {len(files)} files -> {len(docs)} chunks. Writing to '{COLLECTION_NAME}'...")
-    store = build_store(pre_delete=True)  # clean slate each run
+    coll = collection_name(DEMO_TENANT_ID)
+    print(f"Loaded {len(files)} files -> {len(docs)} chunks. Writing to '{coll}'...")
+    store = build_store(DEMO_TENANT_ID, pre_delete=True)  # clean slate each run
     store.add_documents(docs)
-    print("Done. Documents are embedded and searchable.")
+    print("Done. The demo persona's documents are embedded and searchable.")
 
 
 if __name__ == "__main__":

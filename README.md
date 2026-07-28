@@ -1,11 +1,50 @@
 # Replyo
 
-An AI-automation assistant for a small business (persona: **dental clinic**). It
-triages inbound messages, and — across the roadmap — qualifies leads, answers from
-the clinic's own documents (RAG), books appointments, syncs to a CRM, escalates to
-humans, and follows up automatically.
+An AI-automation platform. Any business signs up, uploads its documents and points at
+its website, and gets an embeddable assistant that triages inbound messages, qualifies
+leads, answers from that business's own knowledge (RAG), books appointments, escalates
+sensitive replies to a human, and follows up automatically — across a web widget,
+Telegram and WhatsApp. It began as a single dental-clinic assistant (the demo persona,
+still built in) and became **multi-tenant** in Step 9.
 
-Built step by step with **Python + LangGraph + FastAPI + Postgres (Supabase)**.
+Built step by step with **Python + LangGraph + FastAPI + Postgres (Supabase, RLS) +
+Next.js**.
+
+## Multi-tenant console (Step 9)
+
+One login owns many **personas** (businesses), each fully isolated:
+
+- **Isolation is enforced in Postgres.** Every persona's conversations, review queue and
+  knowledge live under **Row-Level Security**. The app connects as `postgres` (which
+  bypasses RLS) but runs tenant data through `SET ROLE authenticated` + a per-connection
+  `app.tenant_id` GUC, so a forgotten filter can't leak another tenant — an unset tenant
+  sees zero rows, not everything. See `app/tenancy.py` and `supabase/migrations/*multitenancy*`.
+- **Per-persona knowledge.** Each persona has its own pgvector collection; you upload
+  documents and add website URLs (deep-crawled, ~50 pages/site) via the dashboard.
+- **Generated prompt.** A wizard turns the business name + notes + ingested knowledge into
+  a system prompt you can edit; at answer time it's combined with the persona's retrieved
+  chunks.
+- **One embed key per persona.** `<script data-tenant="pk_…">` — the widget resolves the
+  key to a tenant; conversation threads are bound to that tenant server-side, so no one can
+  read or resume another persona's chats.
+
+**Setup (one time):** in Supabase → **Authentication → Providers**, enable **Google** and
+**Email**. Set `SUPABASE_URL` in `.env` (the API verifies login JWTs via its JWKS) and
+`NEXT_PUBLIC_SUPABASE_URL` + `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` in `dashboard/.env.local`.
+Apply the migrations with `uv run python scripts/migrate.py`.
+
+**Run the console:**
+```bash
+cd dashboard && npm install && npm run dev   # http://localhost:3000
+```
+Sign in → create a persona → feed it knowledge → review/edit its prompt → copy the embed
+snippet (and test the assistant live, right on the Install page). The review queue,
+knowledge base and install snippet are all scoped to the active persona.
+
+---
+
+The single-business framing below describes the built-in **demo persona** (BrightSmile
+Dental); it's now one tenant among many.
 
 ## What's built (Steps 1–4, 6–8)
 
@@ -270,3 +309,6 @@ scripts/
 - ~~**Step 6** — human-in-the-loop escalation + Next.js approval dashboard~~ ✅
 - ~~**Step 7** — scheduled 48h re-engagement follow-ups~~ ✅
 - ~~**Step 8 (cross-cutting)** — web chat widget, WhatsApp channel, LangSmith tracing~~ ✅
+- ~~**Step 9** — multi-tenant SaaS: Supabase Auth, Postgres RLS isolation, per-persona
+  knowledge (uploads + website crawl) & generated prompts, tenant-keyed widget, admin console~~ ✅
+  *(phase 1: web widget; Telegram/WhatsApp and booking stay single-tenant for now)*

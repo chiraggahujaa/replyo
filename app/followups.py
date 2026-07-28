@@ -19,10 +19,8 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-import psycopg
-from psycopg.rows import dict_row
-
 from app.config import settings
+from app.tenancy import admin_connection, scoped_connection
 
 logger = logging.getLogger("replyo.followups")
 
@@ -59,16 +57,16 @@ def follow_up_reason(result: dict) -> Optional[str]:
 
 
 # ---- Postgres layer ----
-
-async def _connect() -> psycopg.AsyncConnection:
-    # autocommit keeps these single-statement ops simple and pooler-friendly.
-    return await psycopg.AsyncConnection.connect(
-        settings.database_url, autocommit=True, row_factory=dict_row
-    )
+#
+# Writes tied to a live conversation (schedule/cancel/record_turn) run tenant-scoped,
+# so RLS keeps each persona's nudges separate. The worker's read (list_due) is the one
+# deliberate exception: it must see EVERY tenant's due rows, so it uses an admin
+# connection — the same trust level as a cron job — and carries each row's tenant_id
+# forward so the send/mark-sent happen in the right persona's context.
 
 
 async def schedule(
-    *, thread_id: str, channel: str, chat_id: Optional[str], reason: str,
+    *, tenant_id: str, thread_id: str, channel: str, chat_id: Optional[str], reason: str,
     delay_hours: Optional[float] = None,
 ) -> None:
     """Upsert a pending nudge for this thread, due `delay_hours` from now.
@@ -79,11 +77,11 @@ async def schedule(
     """
     delay = settings.followup_delay_hours if delay_hours is None else delay_hours
     due_at = datetime.now(timezone.utc) + timedelta(hours=delay)
-    async with await _connect() as conn:
+    async with await scoped_connection(tenant_id=tenant_id) as conn:
         await conn.execute(
-            """insert into follow_ups (thread_id, channel, chat_id, reason, due_at, status)
-                    values (%s, %s, %s, %s, %s, 'pending')
-               on conflict (thread_id) do update
+            """insert into follow_ups (tenant_id, thread_id, channel, chat_id, reason, due_at, status)
+                    values (%s, %s, %s, %s, %s, %s, 'pending')
+               on conflict (tenant_id, thread_id) do update
                       set channel = excluded.channel,
                           chat_id = excluded.chat_id,
                           reason = excluded.reason,
@@ -91,13 +89,13 @@ async def schedule(
                           status = 'pending',
                           updated_at = now()
                     where follow_ups.sent_count < %s""",
-            (thread_id, channel, chat_id, reason, due_at, settings.followup_max_sends),
+            (tenant_id, thread_id, channel, chat_id, reason, due_at, settings.followup_max_sends),
         )
 
 
-async def cancel(thread_id: str) -> None:
+async def cancel(*, tenant_id: str, thread_id: str) -> None:
     """Stop nudging this thread — they converted, or a human took over."""
-    async with await _connect() as conn:
+    async with await scoped_connection(tenant_id=tenant_id) as conn:
         await conn.execute(
             "update follow_ups set status = 'cancelled', updated_at = now() "
             "where thread_id = %s and status = 'pending'",
@@ -106,7 +104,7 @@ async def cancel(thread_id: str) -> None:
 
 
 async def record_turn(
-    *, thread_id: str, channel: str, chat_id: Optional[str], result: dict
+    *, tenant_id: str, thread_id: str, channel: str, chat_id: Optional[str], result: dict
 ) -> Optional[str]:
     """Schedule or cancel this thread's nudge based on how the turn ended.
 
@@ -116,9 +114,11 @@ async def record_turn(
     try:
         reason = follow_up_reason(result)
         if reason is None:
-            await cancel(thread_id)
+            await cancel(tenant_id=tenant_id, thread_id=thread_id)
             return None
-        await schedule(thread_id=thread_id, channel=channel, chat_id=chat_id, reason=reason)
+        await schedule(
+            tenant_id=tenant_id, thread_id=thread_id, channel=channel, chat_id=chat_id, reason=reason
+        )
         return reason
     except Exception:
         logger.exception("Could not record follow-up state for thread %s", thread_id)
@@ -126,15 +126,19 @@ async def record_turn(
 
 
 async def list_due(*, force: bool = False) -> list[dict[str, Any]]:
-    """Pending nudges whose `due_at` has passed (every pending row when `force`)."""
+    """Pending nudges whose `due_at` has passed, across ALL tenants (worker/admin path).
+
+    Each row carries its `tenant_id`, so the worker sends and records in the right
+    persona's context.
+    """
     where = "status = 'pending'" if force else "status = 'pending' and due_at <= now()"
-    async with await _connect() as conn:
+    async with await admin_connection() as conn:
         cur = await conn.execute(f"select * from follow_ups where {where} order by due_at asc")
         return await cur.fetchall()
 
 
-async def mark_sent(thread_id: str, message: str) -> None:
-    async with await _connect() as conn:
+async def mark_sent(*, tenant_id: str, thread_id: str, message: str) -> None:
+    async with await scoped_connection(tenant_id=tenant_id) as conn:
         await conn.execute(
             """update follow_ups
                   set status = 'sent', sent_count = sent_count + 1, message = %s,
