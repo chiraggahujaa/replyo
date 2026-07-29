@@ -14,9 +14,14 @@ here must stay in sync with both.
 from __future__ import annotations
 
 import math
+import re
 import time
 
-THEMES = {"teal", "ocean", "violet", "sunset", "rose", "forest", "crimson", "slate"}
+THEMES = {"teal", "ocean", "violet", "sunset", "rose", "forest", "crimson", "slate", "custom"}
+# For theme "custom": the single brand color the widget derives its palette from,
+# and the title/icon ink on it ("auto" = the widget picks by brightness).
+HEX_COLOR = re.compile(r"#[0-9a-fA-F]{6}")
+INKS = {"auto", "white", "black"}
 MODES = {"light", "dark"}
 SIZES = {"compact", "standard", "large", "custom"}
 POSITIONS = {"bottom-right", "bottom-left", "top-right", "top-left"}
@@ -55,10 +60,14 @@ def sanitize_widget_config(raw: object) -> dict:
     # isinstance BEFORE membership: `[] in {…}` hashes the value and raises TypeError,
     # so without the type check hostile JSON would 500 the public config endpoint
     # instead of being sanitized away.
-    for key, allowed in (("theme", THEMES), ("mode", MODES), ("size", SIZES), ("position", POSITIONS)):
+    for key, allowed in (("theme", THEMES), ("mode", MODES), ("size", SIZES), ("position", POSITIONS), ("ink", INKS)):
         v = raw.get(key)
         if isinstance(v, str) and v in allowed:
             out[key] = v
+
+    color = raw.get("color")
+    if isinstance(color, str) and HEX_COLOR.fullmatch(color):
+        out["color"] = color.lower()
 
     for key, lo, hi in (
         ("width", MIN_W, MAX_W),

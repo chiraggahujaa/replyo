@@ -31,7 +31,14 @@
  *     20px):
  *
  *       data-name="Bright Smile Dental"   header title (plain text, never markup)
- *       data-theme="teal|ocean|violet|sunset|rose|forest|crimson|slate"
+ *       data-theme="teal|ocean|violet|sunset|rose|forest|crimson|slate|custom"
+ *       data-color="#rrggbb"              brand accent for data-theme="custom"; the
+ *                                         gradient, message and glow colors are all
+ *                                         derived from this one color. Setting
+ *                                         data-color alone implies data-theme="custom".
+ *       data-ink="auto|white|black"       title/icon color on the gradient (custom
+ *                                         theme only — presets are dark and stay
+ *                                         white); auto picks by the color's brightness
  *       data-mode="light|dark"            panel surfaces; the accent theme is shared
  *       data-size="compact|standard|large|custom"
  *                                         custom = exact dims from data-width/height
@@ -110,6 +117,42 @@
     slate:   { a: "#334155", b: "#64748b", deep: "#1e293b", glow: "rgba(51,65,85,.40)",    ring: "rgba(100,116,139,.22)" },
   };
 
+  const HEX_COLOR = /^#[0-9a-f]{6}$/i;
+  // Text color on the custom gradient. "auto" = decided by the color's brightness.
+  const INKS = { auto: 1, white: 1, black: 1 };
+  const INK_DARK = "#0f172a"; // reads as black; matches the widget's slate text
+
+  function hexLuma(hex) {
+    return (
+      (0.2126 * parseInt(hex.slice(1, 3), 16) +
+        0.7152 * parseInt(hex.slice(3, 5), 16) +
+        0.0722 * parseInt(hex.slice(5, 7), 16)) / 255
+    );
+  }
+
+  // Theme "custom": derive a full palette from one brand color, shaped like the presets
+  // above. `b` lightens toward white for the gradient's far end; `deep` darkens scaled
+  // by luminance so even a bright brand color (yellow, lime) stays readable under the
+  // white text of visitor messages. Mirrored in dashboard/app/install/page.tsx.
+  function customPalette(hex) {
+    const r = parseInt(hex.slice(1, 3), 16), g = parseInt(hex.slice(3, 5), 16), b = parseInt(hex.slice(5, 7), 16);
+    const mix = function (c, t, k) { return Math.round(c + (t - c) * k); };
+    const toHex = function (rgb) {
+      return "#" + rgb.map(function (c) { return c.toString(16).padStart(2, "0"); }).join("");
+    };
+    const light = [mix(r, 255, 0.28), mix(g, 255, 0.28), mix(b, 255, 0.28)];
+    const luma = hexLuma(hex);
+    const k = Math.min(0.68, 0.18 + 0.5 * luma);
+    const deep = [mix(r, 0, k), mix(g, 0, k), mix(b, 0, k)];
+    return {
+      a: hex,
+      b: toHex(light),
+      deep: toHex(deep),
+      glow: "rgba(" + r + "," + g + "," + b + ",.38)",
+      ring: "rgba(" + light.join(",") + ",.20)",
+    };
+  }
+
   // Panel surfaces. Mode is independent of theme so any accent works on either.
   const MODES = {
     light: {
@@ -159,7 +202,9 @@
   // tag takes everything from the console's saved customization.
   const attr = {
     name: (ds.name || "").trim() || null,
-    theme: ds.theme && own.call(THEMES, ds.theme) ? ds.theme : null,
+    theme: ds.theme === "custom" || (ds.theme && own.call(THEMES, ds.theme)) ? ds.theme : null,
+    color: ds.color && HEX_COLOR.test(ds.color) ? ds.color.toLowerCase() : null,
+    ink: ds.ink && own.call(INKS, ds.ink) ? ds.ink : null,
     mode: ds.mode === "dark" || ds.mode === "light" ? ds.mode : null,
     // "custom" pins the sizing MODE (exact dims, standard bubble) even though it has
     // no preset entry — without it, a server preset change could regrow the bubble
@@ -186,7 +231,13 @@
     const preset = own.call(SIZES, sizeId) ? SIZES[sizeId] : SIZES.standard;
     const srvW = intOrNull(srv.width, MIN_W, MAX_W);
     const srvH = intOrNull(srv.height, MIN_H, MAX_H);
-    const themeId = pick(attr.theme, srv.theme && own.call(THEMES, srv.theme) ? srv.theme : null) || "teal";
+    const srvTheme = srv.theme === "custom" || (srv.theme && own.call(THEMES, srv.theme)) ? srv.theme : null;
+    // data-color alone implies theme "custom" — friendlier for hand-edited snippets.
+    const themeId = attr.color && !attr.theme ? "custom" : pick(attr.theme, srvTheme) || "teal";
+    const srvColor = typeof srv.color === "string" && HEX_COLOR.test(srv.color) ? srv.color.toLowerCase() : null;
+    const color = pick(attr.color, srvColor);
+    const srvInk = srv.ink && own.call(INKS, srv.ink) ? srv.ink : null;
+    const inkId = pick(attr.ink, srvInk) || "auto";
     const modeId = pick(attr.mode, srv.mode === "dark" || srv.mode === "light" ? srv.mode : null) || "light";
     const position = pick(attr.position, srv.position && own.call(POSITIONS, srv.position) ? srv.position : null) || "bottom-right";
     const offX = pick(attr.offsetX, intOrNull(srv.offsetX, 0, 200));
@@ -196,6 +247,8 @@
       // can't inject markup onto the host page.
       name: pick(attr.name, srvName) || "BrightSmile Dental",
       themeId: themeId,
+      color: color,
+      inkId: inkId,
       modeId: modeId,
       width: attr.width != null ? attr.width : (sizeId === "custom" && srvW != null ? srvW : preset.w),
       height: attr.height != null ? attr.height : (sizeId === "custom" && srvH != null ? srvH : preset.h),
@@ -207,13 +260,24 @@
   }
 
   function buildStyles(A) {
-    const theme = THEMES[A.themeId];
+    // "custom" has no preset entry; without a usable color it falls back to teal.
+    const theme = A.themeId === "custom" && A.color
+      ? customPalette(A.color)
+      : (own.call(THEMES, A.themeId) ? THEMES[A.themeId] : THEMES.teal);
     const mode = MODES[A.modeId];
     const width = A.width, height = A.height, bubble = A.bubble;
     const offX = A.offX, offY = A.offY;
     const vSide = A.position.indexOf("top") === 0 ? "top" : "bottom";
     const hSide = A.position.indexOf("left") >= 0 ? "left" : "right";
     const gradient = `linear-gradient(135deg, ${theme.a}, ${theme.b})`;
+    // Title/icon color on the gradient. Only the custom theme can be light enough to
+    // need dark ink; presets are all dark and keep their original white. Children of
+    // .head use opacity for hierarchy, so one ink color covers title, sub and close.
+    const ink = A.themeId === "custom" && A.color
+      ? (A.inkId === "white" ? "#fff"
+        : A.inkId === "black" ? INK_DARK
+        : (hexLuma(theme.a) + hexLuma(theme.b)) / 2 > 0.6 ? INK_DARK : "#fff")
+      : "#fff";
     // The panel sits above the bubble in bottom corners and below it in top corners.
     const panelV = offY + bubble + 12;
 
@@ -223,7 +287,7 @@
     .bubble {
       position: fixed; ${hSide}: ${offX}px; ${vSide}: ${offY}px; width: ${bubble}px; height: ${bubble}px;
       border-radius: 50%; border: 0; cursor: pointer; z-index: 2147483000;
-      background: ${gradient}; color: #fff;
+      background: ${gradient}; color: ${ink};
       box-shadow: 0 10px 28px ${theme.glow};
       display: grid; place-items: center; transition: transform .15s ease;
     }
@@ -243,14 +307,14 @@
     }
     .panel.open { display: flex; }
     .head {
-      padding: 14px 16px; background: ${gradient}; color: #fff;
+      padding: 14px 16px; background: ${gradient}; color: ${ink};
       display: flex; align-items: center; justify-content: space-between; gap: 8px;
     }
     .title { font-size: 14px; font-weight: 700; letter-spacing: -.01em; }
     .sub { font-size: 11px; opacity: .9; margin-top: 2px; display: flex; align-items: center; gap: 5px; }
     .dot { width: 6px; height: 6px; border-radius: 50%; background: #4ade80; }
     .dot.off { background: #fbbf24; }
-    .close { background: transparent; border: 0; color: #fff; cursor: pointer; font-size: 21px; line-height: 1; opacity: .85; }
+    .close { background: transparent; border: 0; color: ${ink}; cursor: pointer; font-size: 21px; line-height: 1; opacity: .85; }
     .close:hover { opacity: 1; }
     .log { flex: 1; overflow-y: auto; padding: 14px; display: flex; flex-direction: column; gap: 8px; background: ${mode.logBg}; }
     .msg { max-width: 84%; padding: 9px 12px; border-radius: 14px; font-size: 13.5px; line-height: 1.5; white-space: pre-wrap; word-wrap: break-word; }

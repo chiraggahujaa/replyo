@@ -33,7 +33,49 @@ const THEMES = [
   { id: "crimson", label: "Crimson", a: "#b91c1c", b: "#ef4444", deep: "#991b1b" },
   { id: "slate", label: "Slate", a: "#334155", b: "#64748b", deep: "#1e293b" },
 ] as const;
-type ThemeId = (typeof THEMES)[number]["id"];
+// "custom" derives a full palette from one user-picked brand color instead of a preset.
+type ThemeId = (typeof THEMES)[number]["id"] | "custom";
+
+type Palette = { a: string; b: string; deep: string };
+// Title/icon color on the custom gradient; "auto" = picked by the color's brightness.
+type InkId = "auto" | "white" | "black";
+
+const DEFAULT_COLOR = "#0f766e";
+const HEX_COLOR = /^#[0-9a-f]{6}$/i;
+const INK_DARK = "#0f172a"; // mirrors INK_DARK in app/static/widget.js
+
+const hexLuma = (hex: string) =>
+  (0.2126 * parseInt(hex.slice(1, 3), 16) +
+    0.7152 * parseInt(hex.slice(3, 5), 16) +
+    0.0722 * parseInt(hex.slice(5, 7), 16)) /
+  255;
+
+// Resolved ink for a custom palette — same rule as the widget's buildStyles.
+const inkFor = (p: Palette, ink: InkId) =>
+  ink === "white"
+    ? "#fff"
+    : ink === "black"
+      ? INK_DARK
+      : (hexLuma(p.a) + hexLuma(p.b)) / 2 > 0.6
+        ? INK_DARK
+        : "#fff";
+
+// Derive the widget's palette shape from one brand color — must mirror customPalette
+// in app/static/widget.js so the swatch previews exactly what the widget will render.
+// `b` lightens toward white for the gradient's far end; `deep` darkens scaled by
+// luminance so even a bright brand color stays readable under white message text.
+function customPalette(hex: string): Palette {
+  const r = parseInt(hex.slice(1, 3), 16);
+  const g = parseInt(hex.slice(3, 5), 16);
+  const b = parseInt(hex.slice(5, 7), 16);
+  const mix = (c: number, t: number, k: number) => Math.round(c + (t - c) * k);
+  const toHex = (rgb: number[]) =>
+    "#" + rgb.map((c) => c.toString(16).padStart(2, "0")).join("");
+  const light = [mix(r, 255, 0.28), mix(g, 255, 0.28), mix(b, 255, 0.28)];
+  const luma = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+  const k = Math.min(0.68, 0.18 + 0.5 * luma);
+  return { a: hex, b: toHex(light), deep: toHex([mix(r, 0, k), mix(g, 0, k), mix(b, 0, k)]) };
+}
 
 // The widget's two surface modes, used to paint the theme swatches so each palette
 // previews exactly how it will sit on the chosen mode.
@@ -69,6 +111,8 @@ type PositionId = (typeof POSITIONS)[number]["id"];
 type WidgetConfig = {
   name: string;
   theme: ThemeId;
+  color: string; // brand hex, used when theme === "custom"; kept when switching away
+  ink: InkId; // text on the custom gradient; presets are dark and always use white
   mode: ModeId;
   size: SizeId;
   width: number;
@@ -82,6 +126,8 @@ function defaultConfig(personaName: string): WidgetConfig {
   return {
     name: personaName,
     theme: "teal",
+    color: DEFAULT_COLOR,
+    ink: "auto",
     mode: "light",
     size: "standard",
     width: SIZES.standard.w,
@@ -123,7 +169,10 @@ const clampNum = (v: unknown, lo: number, hi: number, fallback: number) =>
 function mergeConfig(defaults: WidgetConfig, stored?: Partial<WidgetConfig>): WidgetConfig {
   const m: WidgetConfig = { ...defaults, ...stored };
   if (typeof m.name !== "string") m.name = defaults.name;
-  if (!THEMES.some((t) => t.id === m.theme)) m.theme = defaults.theme;
+  if (m.theme !== "custom" && !THEMES.some((t) => t.id === m.theme)) m.theme = defaults.theme;
+  m.color =
+    typeof m.color === "string" && HEX_COLOR.test(m.color) ? m.color.toLowerCase() : defaults.color;
+  if (m.ink !== "auto" && m.ink !== "white" && m.ink !== "black") m.ink = defaults.ink;
   if (m.mode !== "light" && m.mode !== "dark") m.mode = defaults.mode;
   if (m.size !== "custom" && !Object.keys(SIZES).includes(m.size)) m.size = defaults.size;
   if (!POSITIONS.some((p) => p.id === m.position)) m.position = defaults.position;
@@ -150,7 +199,13 @@ function buildAttrs(cfg: WidgetConfig, personaName: string, publicKey: string, p
     ["data-tenant", publicKey],
     ["data-name", cfg.name.trim() || personaName],
   ];
-  if (pinAll || cfg.theme !== "teal") attrs.push(["data-theme", cfg.theme]);
+  if (cfg.theme === "custom") {
+    // data-color pins the exact brand color alongside the mode, like custom sizing.
+    attrs.push(["data-theme", "custom"], ["data-color", cfg.color]);
+    if (pinAll || cfg.ink !== "auto") attrs.push(["data-ink", cfg.ink]);
+  } else if (pinAll || cfg.theme !== "teal") {
+    attrs.push(["data-theme", cfg.theme]);
+  }
   if (pinAll || cfg.mode !== "light") attrs.push(["data-mode", cfg.mode]);
   if (cfg.size === "custom") {
     // data-size="custom" pins the sizing MODE too — without it a later console preset
@@ -299,6 +354,15 @@ function Install() {
     );
   }
 
+  // Derived looks, shared by the custom tile, the brand-color row and the corner
+  // picker: the custom palette always previews the SAVED color (even while a preset
+  // is selected), while `palette`/`headerInk` follow whatever is actually active.
+  const customPal = customPalette(value.color);
+  const customInk = inkFor(customPal, value.ink);
+  const palette: Palette =
+    value.theme === "custom" ? customPal : THEMES.find((t) => t.id === value.theme) ?? THEMES[0];
+  const headerInk = value.theme === "custom" ? customInk : "#fff";
+
   // Persisting inside the event handler (not an effect) keeps writes tied to real user
   // action and satisfies the set-state-in-effect lint rule. The backend save is what
   // lets a plain src+data-tenant embed (e.g. the clinic site) pick the changes up on
@@ -445,7 +509,78 @@ function Install() {
                   onSelect={() => patch({ theme: t.id })}
                 />
               ))}
+              <ThemeSwatch
+                theme={{
+                  label: (
+                    <span className="flex items-center gap-1.5">
+                      <span
+                        aria-hidden
+                        className="h-3 w-3 rounded-full"
+                        style={{
+                          background:
+                            "conic-gradient(#ef4444, #f59e0b, #22c55e, #38bdf8, #6d28d9, #ef4444)",
+                        }}
+                      />
+                      Custom
+                    </span>
+                  ),
+                  ...customPal,
+                }}
+                ink={customInk}
+                mode={value.mode}
+                selected={value.theme === "custom"}
+                onSelect={() => patch({ theme: "custom" })}
+              />
             </div>
+            {value.theme === "custom" && (
+              <div className="mt-4 space-y-4 rounded-2xl border border-[var(--color-border)] bg-[var(--color-bg-soft)] p-4">
+                <div className="flex flex-wrap items-center gap-4">
+                  {/* The label IS the swatch: clicking it opens the browser's native
+                      color picker via the invisible input stretched across it. */}
+                  <label
+                    className="relative h-10 w-10 shrink-0 cursor-pointer overflow-hidden rounded-xl border border-[var(--color-border-strong)] shadow-sm transition-transform hover:scale-105"
+                    style={{
+                      background: `linear-gradient(135deg, ${value.color}, ${customPal.b})`,
+                    }}
+                  >
+                    <input
+                      type="color"
+                      value={value.color}
+                      aria-label="Pick a custom brand color"
+                      onChange={(e) => patch({ color: e.target.value.toLowerCase() })}
+                      className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
+                    />
+                  </label>
+                  <div className="min-w-0 flex-1">
+                    <div className="text-[13px] font-semibold">Brand color</div>
+                    <p className="mt-0.5 text-[12.5px] text-[var(--color-faint)]">
+                      Tap the swatch to pick, or paste a hex. The gradient, message and glow
+                      colors all derive from this one color.
+                    </p>
+                  </div>
+                  <HexField value={value.color} onChange={(color) => patch({ color })} />
+                </div>
+                <div className="flex flex-wrap items-center justify-between gap-3 border-t border-[var(--color-border)] pt-4">
+                  <div className="min-w-0">
+                    <div className="text-[13px] font-semibold">Header text</div>
+                    <p className="mt-0.5 text-[12.5px] text-[var(--color-faint)]">
+                      The name and icons on your color.{" "}
+                      <span className="font-medium">Auto</span> picks{" "}
+                      {inkFor(customPal, "auto") === "#fff" ? "white" : "black"} for this shade.
+                    </p>
+                  </div>
+                  <Segmented
+                    value={value.ink}
+                    onChange={(ink) => patch({ ink })}
+                    options={[
+                      { value: "auto" as InkId, label: "Auto" },
+                      { value: "white" as InkId, label: "White" },
+                      { value: "black" as InkId, label: "Black" },
+                    ]}
+                  />
+                </div>
+              </div>
+            )}
           </Card>
 
           {/* Size */}
@@ -504,7 +639,8 @@ function Install() {
             <div className="flex flex-col gap-5 sm:flex-row sm:items-start">
               <CornerPicker
                 value={value.position}
-                theme={THEMES.find((t) => t.id === value.theme) ?? THEMES[0]}
+                theme={palette}
+                ink={headerInk}
                 onChange={(position) => patch({ position })}
               />
               <div className="min-w-0 flex-1 space-y-4">
@@ -671,11 +807,13 @@ function Segmented<T extends string>({
 
 function ThemeSwatch({
   theme,
+  ink = "#fff",
   mode,
   selected,
   onSelect,
 }: {
-  theme: (typeof THEMES)[number];
+  theme: Palette & { label: React.ReactNode };
+  ink?: string; // header text/icon color in the mini preview; presets stay white
   mode: ModeId;
   selected: boolean;
   onSelect: () => void;
@@ -697,8 +835,8 @@ function ThemeSwatch({
         className="flex h-8 items-center gap-1.5 px-2.5"
         style={{ background: `linear-gradient(135deg, ${theme.a}, ${theme.b})` }}
       >
-        <span className="h-1.5 w-1.5 rounded-full bg-white/80" />
-        <span className="h-1.5 w-10 rounded-full bg-white/70" />
+        <span className="h-1.5 w-1.5 rounded-full opacity-80" style={{ background: ink }} />
+        <span className="h-1.5 w-10 rounded-full opacity-70" style={{ background: ink }} />
       </div>
       <div className="space-y-1.5 px-2.5 py-2.5" style={{ background: surface.logBg }}>
         <div
@@ -712,6 +850,56 @@ function ThemeSwatch({
         {selected && <CheckIcon className="h-3.5 w-3.5 text-[var(--color-accent-ink)]" />}
       </div>
     </button>
+  );
+}
+
+// Hex input that commits only valid colors: a complete #rrggbb applies as you type,
+// while shorthand (#abc, missing #) is normalized on blur/Enter. Invalid drafts never
+// reach patch(), so the preview and snippet always hold a real color.
+function HexField({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  const [draft, setDraft] = useState(value);
+  const [editing, setEditing] = useState(false);
+
+  const normalize = (raw: string) => {
+    let v = raw.trim().toLowerCase();
+    if (v && v[0] !== "#") v = "#" + v;
+    if (/^#[0-9a-f]{3}$/.test(v))
+      v =
+        "#" +
+        v
+          .slice(1)
+          .split("")
+          .map((c) => c + c)
+          .join("");
+    return HEX_COLOR.test(v) ? v : null;
+  };
+
+  return (
+    <input
+      // While editing, show the raw draft; otherwise mirror the canonical value so
+      // native-picker changes flow in.
+      value={editing ? draft : value}
+      onFocus={() => {
+        setDraft(value);
+        setEditing(true);
+      }}
+      onChange={(e) => {
+        setDraft(e.target.value);
+        if (HEX_COLOR.test(e.target.value.trim())) onChange(e.target.value.trim().toLowerCase());
+      }}
+      onBlur={() => {
+        const v = normalize(draft);
+        if (v) onChange(v);
+        setEditing(false);
+      }}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+      }}
+      maxLength={7}
+      spellCheck={false}
+      aria-label="Custom color hex value"
+      className="w-24 rounded-xl border border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-2 text-center font-mono text-[13px] text-[var(--color-text)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring)]"
+    />
   );
 }
 
@@ -755,10 +943,12 @@ function LabeledSlider({
 function CornerPicker({
   value,
   theme,
+  ink = "#fff",
   onChange,
 }: {
   value: PositionId;
-  theme: (typeof THEMES)[number];
+  theme: Palette;
+  ink?: string; // icon color on the selected corner's gradient bubble
   onChange: (v: PositionId) => void;
 }) {
   const spot: Record<PositionId, string> = {
@@ -787,12 +977,12 @@ function CornerPicker({
             onClick={() => onChange(p.id)}
             className={`absolute grid h-8 w-8 place-items-center rounded-full transition-all duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring)] ${spot[p.id]} ${
               selected
-                ? "text-white shadow-lg"
+                ? "shadow-lg"
                 : "border-2 border-dashed border-[var(--color-border-strong)] bg-[var(--color-surface)]/60 hover:border-[var(--color-accent)]"
             }`}
             style={
               selected
-                ? { background: `linear-gradient(135deg, ${theme.a}, ${theme.b})` }
+                ? { background: `linear-gradient(135deg, ${theme.a}, ${theme.b})`, color: ink }
                 : undefined
             }
           >
