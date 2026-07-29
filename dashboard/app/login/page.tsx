@@ -4,7 +4,8 @@ import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabase";
 import { useReplyo } from "../providers";
-import { SparkIcon } from "../components/icons";
+import { Button, Card, TextInput } from "../components/ui";
+import { SparkIcon, ArrowRightIcon } from "../components/icons";
 
 export default function LoginPage() {
   const { session, ready } = useReplyo();
@@ -16,20 +17,25 @@ export default function LoginPage() {
   const [msg, setMsg] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
-  // Already signed in -> go to the console.
+  // Already signed in -> go to the console (the root is the public landing page).
   useEffect(() => {
-    if (ready && session) router.replace("/");
+    if (ready && session) router.replace("/queue");
   }, [ready, session, router]);
 
   async function google() {
     setErr(null);
+    // Land straight in the console. If this URL isn't in Supabase's redirect allowlist
+    // it falls back to the Site URL (the landing page) — which also forwards signed-in
+    // visitors to /queue, so either way login always ends in the console.
     await supabase.auth.signInWithOAuth({
       provider: "google",
-      options: { redirectTo: typeof window !== "undefined" ? window.location.origin : undefined },
+      options: {
+        redirectTo: typeof window !== "undefined" ? `${window.location.origin}/queue` : undefined,
+      },
     });
   }
 
-  async function emailPassword(e: React.FormEvent) {
+  async function emailPassword(e: React.SubmitEvent<HTMLFormElement>) {
     e.preventDefault();
     setBusy(true);
     setErr(null);
@@ -43,7 +49,7 @@ export default function LoginPage() {
       } else {
         const { error } = await supabase.auth.signInWithPassword({ email, password });
         if (error) throw error;
-        router.replace("/");
+        router.replace("/queue");
       }
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Something went wrong");
@@ -53,74 +59,99 @@ export default function LoginPage() {
   }
 
   return (
-    <div className="flex flex-1 items-center justify-center px-4 py-10 bg-[var(--color-bg)]">
-      <div className="w-full max-w-[380px]">
-        <div className="flex items-center gap-2.5 justify-center mb-7">
-          <div className="grid h-10 w-10 place-items-center rounded-2xl bg-gradient-to-br from-indigo-500 to-violet-500 text-white shadow">
-            <SparkIcon className="w-5 h-5" />
+    <div className="flex flex-1 items-center justify-center px-4 py-10">
+      <div className="animate-in w-full max-w-[400px]">
+        {/* Hero mark */}
+        <div className="mb-8 flex flex-col items-center gap-4 text-center">
+          <div className="animate-float grid h-16 w-16 place-items-center rounded-[20px] bg-cta text-white glow-accent-lg">
+            <SparkIcon className="h-8 w-8" />
           </div>
-          <div className="text-[19px] font-semibold tracking-tight">Replyo</div>
+          <div>
+            <div className="text-gradient-animated font-display text-[30px] font-semibold tracking-tight">
+              Replyo
+            </div>
+            <p className="mt-1 text-[14px] text-[var(--color-muted)]">
+              Build AI assistants for your business.
+            </p>
+          </div>
         </div>
 
-        <div className="rounded-2xl border border-[var(--color-border)] bg-[var(--color-surface)] p-6 shadow-sm">
-          <h1 className="text-[17px] font-semibold tracking-tight">
-            {mode === "signin" ? "Sign in" : "Create your account"}
+        <Card className="p-7 animate-pop">
+          <h1 className="font-display text-[20px] font-semibold tracking-tight">
+            {mode === "signin" ? "Welcome back" : "Create your account"}
           </h1>
-          <p className="mt-1 text-[13px] text-[var(--color-faint)]">
-            Build AI assistants for your business.
+          <p className="mt-1.5 text-[14px] text-[var(--color-muted)]">
+            {mode === "signin"
+              ? "Sign in to continue to your console."
+              : "Start building your assistant in minutes."}
           </p>
 
-          <button
+          <Button
+            type="button"
+            variant="secondary"
+            full
+            className="mt-6"
             onClick={google}
-            className="mt-5 w-full inline-flex items-center justify-center gap-2 rounded-xl border border-[var(--color-border-strong)] bg-[var(--color-surface)] px-4 py-2.5 text-[13.5px] font-semibold hover:bg-[var(--color-bg-soft)] transition"
+            icon={<GoogleMark />}
           >
-            <GoogleMark /> Continue with Google
-          </button>
+            Continue with Google
+          </Button>
 
-          <div className="my-4 flex items-center gap-3 text-[11px] text-[var(--color-faint)]">
-            <div className="h-px flex-1 bg-[var(--color-border)]" /> or <div className="h-px flex-1 bg-[var(--color-border)]" />
+          <div className="my-5 flex items-center gap-3 text-[12.5px] text-[var(--color-faint)]">
+            <div className="h-px flex-1 bg-[var(--color-border)]" />
+            or
+            <div className="h-px flex-1 bg-[var(--color-border)]" />
           </div>
 
-          <form onSubmit={emailPassword} className="space-y-2.5">
-            <input
+          <form onSubmit={emailPassword} className="space-y-3">
+            <TextInput
               type="email"
               required
               value={email}
               onChange={(e) => setEmail(e.target.value)}
               placeholder="you@business.com"
-              className="w-full rounded-xl border border-[var(--color-border-strong)] bg-[var(--color-surface)] px-3.5 py-2.5 text-[13.5px] outline-none focus:border-[var(--color-accent)] focus:ring-2 focus:ring-[var(--ring)]"
             />
-            <input
+            <TextInput
               type="password"
               required
               minLength={6}
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               placeholder="Password"
-              className="w-full rounded-xl border border-[var(--color-border-strong)] bg-[var(--color-surface)] px-3.5 py-2.5 text-[13.5px] outline-none focus:border-[var(--color-accent)] focus:ring-2 focus:ring-[var(--ring)]"
             />
-            <button
-              disabled={busy}
-              className="w-full rounded-xl bg-[var(--color-accent)] px-4 py-2.5 text-[13.5px] font-semibold text-white hover:opacity-90 disabled:opacity-60 transition"
+            <Button
+              type="submit"
+              full
+              loading={busy}
+              icon={<ArrowRightIcon className="h-4 w-4" />}
             >
-              {busy ? "…" : mode === "signin" ? "Sign in" : "Create account"}
-            </button>
+              {mode === "signin" ? "Sign in" : "Create account"}
+            </Button>
           </form>
 
-          {err && <p className="mt-3 text-[12.5px] text-rose-500">{err}</p>}
-          {msg && <p className="mt-3 text-[12.5px] text-emerald-600">{msg}</p>}
+          {err && (
+            <p className="animate-in mt-4 text-[13px] font-medium text-[var(--color-danger)]">
+              {err}
+            </p>
+          )}
+          {msg && (
+            <p className="animate-in mt-4 text-[13px] font-medium text-[var(--color-success)]">
+              {msg}
+            </p>
+          )}
 
           <button
+            type="button"
             onClick={() => {
               setMode((m) => (m === "signin" ? "signup" : "signin"));
               setErr(null);
               setMsg(null);
             }}
-            className="mt-4 w-full text-center text-[12.5px] text-[var(--color-muted)] hover:text-[var(--color-text)]"
+            className="mt-5 w-full rounded-full py-1 text-center text-[13px] text-[var(--color-muted)] transition-colors hover:text-[var(--color-accent-ink)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring)]"
           >
             {mode === "signin" ? "New here? Create an account" : "Already have an account? Sign in"}
           </button>
-        </div>
+        </Card>
       </div>
     </div>
   );

@@ -192,8 +192,8 @@ async def run_turn(
                 await on_token(content)
 
     # Read the authoritative persisted state rather than reassembling it from the
-    # stream — the final message may differ from the streamed tokens (answer_from_docs
-    # appends a `Sources:` footer, and a held turn replies with a holding message).
+    # stream — the final message may differ from the streamed tokens (a held turn
+    # replies with a holding message instead of the draft).
     snapshot = await graph.aget_state(config)
     return _shape_result(dict(snapshot.values or {}), interrupts)
 

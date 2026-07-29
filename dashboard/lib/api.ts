@@ -43,6 +43,13 @@ export type Persona = {
   extra_notes: string | null;
   timezone: string;
   onboarding_status: string;
+  // Lifecycle: "active" | "paused". Paused personas keep their console but the public
+  // widget stops answering. Optional so the dashboard keeps working against a backend
+  // that predates the status migration (absent -> active).
+  status?: "active" | "paused";
+  // Widget appearance saved from the Install page (name + styling). Optional so the
+  // dashboard keeps working against a backend that predates the widget_config migration.
+  widget_config?: Record<string, unknown> | null;
   created_at: string;
 };
 
@@ -84,6 +91,10 @@ export const getActivePersona = (tenantId: string) =>
   req<Persona>("/api/personas/active", { tenantId });
 export const updatePersona = (tenantId: string, patch: Partial<Persona>) =>
   req<Persona>("/api/personas/active", { method: "PATCH", tenantId, body: JSON.stringify(patch) });
+// Owner-only (403 for plain members). Cascades wipe the persona's knowledge, reviews
+// and follow-ups; its embed key stops resolving.
+export const deletePersona = (tenantId: string) =>
+  req<void>("/api/personas/active", { method: "DELETE", tenantId });
 export const generatePrompt = (tenantId: string, name: string, notes: string) =>
   req<{ system_prompt: string }>("/api/personas/active/generate-prompt", {
     method: "POST",

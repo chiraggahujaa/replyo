@@ -9,14 +9,19 @@ off as a background task and the dashboard polls the source's status.
 
 from __future__ import annotations
 
-from typing import Optional
+import logging
+from typing import Literal, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, UploadFile
+from psycopg.types.json import Jsonb
 from pydantic import BaseModel, Field
 
 from app.knowledge import ingest_upload, ingest_website
 from app.persona import generate_system_prompt
+from app.rag import build_store
+from app.widget_config import cache_invalidate, sanitize_widget_config
 from app.tenancy import (
+    DEMO_TENANT_ID,
     User,
     create_tenant,
     get_current_user,
@@ -24,6 +29,8 @@ from app.tenancy import (
     scoped_connection,
     tenant_for_user,
 )
+
+logger = logging.getLogger("replyo.admin")
 
 router = APIRouter(prefix="/api", tags=["admin"])
 
@@ -42,6 +49,13 @@ class UpdatePersona(BaseModel):
     system_prompt: Optional[str] = None
     extra_notes: Optional[str] = None
     onboarding_status: Optional[str] = None
+    # Lifecycle: paused personas keep their console but the public widget answers with
+    # an "unavailable" notice and follow-ups skip them. Literal so nothing else can be
+    # written into the column (it's CHECK-constrained anyway; fail at 422, not 500).
+    status: Optional[Literal["active", "paused"]] = None
+    # Widget appearance (name + styling) from the Install page. Sanitized on write;
+    # `{}` is the reset (embeds fall back to defaults + the persona's name).
+    widget_config: Optional[dict] = None
 
 
 class AddWebsite(BaseModel):
@@ -96,6 +110,9 @@ async def update(
     fields = {k: v for k, v in body.model_dump(exclude_none=True).items()}
     if not fields:
         return tenant
+    if "widget_config" in fields:
+        # Whitelist keys + clamp values, and wrap for the jsonb column.
+        fields["widget_config"] = Jsonb(sanitize_widget_config(fields["widget_config"]))
     sets = ", ".join(f"{k} = %s" for k in fields) + ", updated_at = now()"
     params = list(fields.values()) + [str(tenant["id"])]
     async with await scoped_connection(user_id=user.id, tenant_id=str(tenant["id"])) as conn:
@@ -104,6 +121,11 @@ async def update(
         )).fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Persona not found")
+    if "widget_config" in fields or "name" in fields:
+        # Drop the public config cache so embeds see the change next load ("" is the
+        # demo-fallback entry, used when a tag carries no tenant key).
+        cache_invalidate(row["public_key"])
+        cache_invalidate("")
     return row
 
 
@@ -115,6 +137,44 @@ async def generate(body: GeneratePrompt, tenant: dict = Depends(_require_tenant)
         tenant_id=str(tenant["id"]), name=body.name, notes=body.notes
     )
     return {"system_prompt": prompt}
+
+
+def _drop_vector_collection(tenant_id: str) -> None:
+    """Best-effort removal of a deleted persona's pgvector collection. The collection is
+    library-managed (no FK to tenants), so the row cascade can't reach it; sync SQLAlchemy
+    under the hood, so it runs as a background task (FastAPI threads sync tasks). A failure
+    only strands unreachable vectors — the collection is named by the now-deleted id."""
+    try:
+        build_store(tenant_id).delete_collection()
+    except Exception:
+        logger.exception("Could not drop vector collection for deleted persona %s", tenant_id)
+
+
+@router.delete("/personas/active", status_code=204)
+async def delete_persona(
+    background: BackgroundTasks,
+    user: User = Depends(get_current_user),
+    tenant: dict = Depends(_require_tenant),
+) -> None:
+    """Permanently delete the active persona (knowledge, reviews, follow-ups cascade).
+
+    RLS is the authorization: the tenants_delete policy only matches for an OWNER, so a
+    plain member's DELETE touches 0 rows -> 403. LangGraph checkpointer threads are left
+    behind on purpose — their ids embed the tenant id, and with the tenant (and its
+    public key) gone no request can resolve to them again.
+    """
+    tid = str(tenant["id"])
+    if tid == DEMO_TENANT_ID:
+        raise HTTPException(400, "The demo persona is shared infrastructure and cannot be deleted.")
+    async with await scoped_connection(user_id=user.id, tenant_id=tid) as conn:
+        row = await (await conn.execute(
+            "delete from tenants where id = %s returning id", (tid,)
+        )).fetchone()
+    if not row:
+        raise HTTPException(403, "Only an owner can delete a persona.")
+    # Embeds must stop resolving the key now (this process), not after the cache TTL.
+    cache_invalidate(tenant["public_key"])
+    background.add_task(_drop_vector_collection, tid)
 
 
 # ---------------------------------------------------------------------------

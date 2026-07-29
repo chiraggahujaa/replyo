@@ -129,11 +129,18 @@ async def list_due(*, force: bool = False) -> list[dict[str, Any]]:
     """Pending nudges whose `due_at` has passed, across ALL tenants (worker/admin path).
 
     Each row carries its `tenant_id`, so the worker sends and records in the right
-    persona's context.
+    persona's context. Paused personas are skipped, not cancelled: their rows stay
+    `pending`, so nudges resume (late) if the owner reactivates. Deleted personas
+    need no handling — the cascade already removed their rows.
     """
-    where = "status = 'pending'" if force else "status = 'pending' and due_at <= now()"
+    where = "f.status = 'pending'" if force else "f.status = 'pending' and f.due_at <= now()"
     async with await admin_connection() as conn:
-        cur = await conn.execute(f"select * from follow_ups where {where} order by due_at asc")
+        cur = await conn.execute(
+            f"""select f.* from follow_ups f
+                join tenants t on t.id = f.tenant_id
+                where {where} and t.status = 'active'
+                order by f.due_at asc"""
+        )
         return await cur.fetchall()
 
 

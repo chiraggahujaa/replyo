@@ -2,21 +2,22 @@
 
 import { useEffect, useRef, useState } from "react";
 import { DecisionAction, Review, timeAgo } from "@/lib/api";
-import { AlertIcon, CheckIcon, SendIcon, SpinnerIcon, XIcon } from "./icons";
+import { Badge, Button, TextArea } from "./ui";
+import { AlertIcon, CheckIcon, SendIcon, XIcon } from "./icons";
 
 function Bubble({ role, content }: { role: "human" | "ai"; content: string }) {
   const isCustomer = role === "human";
   return (
-    <div className={`flex ${isCustomer ? "justify-start" : "justify-end"}`}>
+    <div className={`animate-in flex ${isCustomer ? "justify-start" : "justify-end"}`}>
       <div
-        className={`max-w-[82%] rounded-2xl px-3.5 py-2.5 text-[13.5px] leading-relaxed
+        className={`max-w-[82%] rounded-3xl px-4 py-3 text-[14.5px] leading-relaxed
           ${
             isCustomer
-              ? "bg-[var(--color-surface-2)] border border-[var(--color-border)] rounded-tl-md text-[var(--color-text)]"
-              : "bg-[var(--color-accent)] text-white rounded-tr-md"
+              ? "bg-[var(--color-surface-2)] border border-[var(--color-border)] rounded-tl-lg text-[var(--color-text)]"
+              : "bg-cta text-white rounded-tr-lg glow-accent"
           }`}
       >
-        <div className={`mb-0.5 text-[10px] font-semibold uppercase tracking-wide ${isCustomer ? "text-[var(--color-faint)]" : "text-white/70"}`}>
+        <div className={`mb-0.5 text-[11px] font-semibold uppercase tracking-wide ${isCustomer ? "text-[var(--color-faint)]" : "text-white/70"}`}>
           {isCustomer ? "Customer" : "Assistant"}
         </div>
         {content}
@@ -68,11 +69,11 @@ export function ReviewDetail({
       {/* header */}
       <div className="px-6 py-4 border-b border-[var(--color-border)] flex items-start justify-between gap-4">
         <div>
-          <div className="inline-flex items-center gap-2 rounded-full bg-amber-500/10 px-2.5 py-1 text-[11px] font-semibold uppercase tracking-wide text-amber-600 dark:text-amber-400">
-            <AlertIcon className="w-3.5 h-3.5" />
+          <Badge tone="warning">
+            <AlertIcon className="h-3.5 w-3.5" />
             {review.reason || "Needs review"}
-          </div>
-          <div className="mt-2 flex items-center gap-2 text-[12px] text-[var(--color-faint)]">
+          </Badge>
+          <div className="mt-2 flex items-center gap-2 text-[12.5px] text-[var(--color-muted)]">
             <span className="capitalize">{review.channel}</span>
             <span>·</span>
             <span className="font-mono">{review.thread_id}</span>
@@ -83,12 +84,12 @@ export function ReviewDetail({
       </div>
 
       {/* conversation */}
-      <div ref={scrollRef} className="flex-1 min-h-0 overflow-y-auto px-6 py-5 space-y-2.5">
+      <div ref={scrollRef} className="stagger flex-1 min-h-0 overflow-y-auto px-6 py-5 space-y-3">
         {(review.conversation ?? []).map((t, i) => (
           <Bubble key={i} role={t.role} content={t.content} />
         ))}
         {(!review.conversation || review.conversation.length === 0) && (
-          <p className="text-[13px] text-[var(--color-faint)]">No prior messages captured.</p>
+          <p className="text-[14px] text-[var(--color-faint)]">No prior messages captured.</p>
         )}
       </div>
 
@@ -100,40 +101,36 @@ export function ReviewDetail({
             <span className="normal-case font-medium text-[var(--color-faint)]"> · AI draft, not sent yet</span>
             {edited && <span className="text-[var(--color-accent-ink)] normal-case font-medium"> · edited</span>}
           </label>
-          <span className="text-[11px] text-[var(--color-faint)]">{draft.length} chars</span>
+          <span className="text-[11px] tabular-nums text-[var(--color-faint)]">{draft.length} chars</span>
         </div>
-        <textarea
+        <TextArea
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
           rows={4}
           spellCheck
-          className="w-full resize-none rounded-xl border border-[var(--color-border-strong)] bg-[var(--color-surface)] px-3.5 py-3 text-[13.5px] leading-relaxed text-[var(--color-text)] outline-none transition focus:border-[var(--color-accent)] focus:ring-2 focus:ring-[var(--ring)]"
+          className="resize-none"
           placeholder="The reply that will be sent to the customer…"
         />
         <div className="mt-3 flex items-center gap-2.5">
-          <button
+          <Button
+            variant="success"
+            loading={busy === "approve" || busy === "edit"}
+            disabled={!!busy}
+            icon={edited ? <SendIcon className="h-4 w-4" /> : <CheckIcon className="h-4 w-4" />}
             onClick={() => act(edited ? "edit" : "approve")}
-            disabled={!!busy}
-            className="inline-flex items-center gap-2 rounded-xl bg-emerald-600 px-4 py-2.5 text-[13px] font-semibold text-white shadow-sm transition hover:bg-emerald-500 active:scale-[0.98] disabled:opacity-60"
           >
-            {busy === "approve" || busy === "edit" ? (
-              <SpinnerIcon className="w-4 h-4 animate-spin" />
-            ) : edited ? (
-              <SendIcon className="w-4 h-4" />
-            ) : (
-              <CheckIcon className="w-4 h-4" />
-            )}
             {edited ? "Send edited reply" : "Approve & send"}
-          </button>
-          <button
-            onClick={() => act("reject")}
+          </Button>
+          <Button
+            variant="danger"
+            loading={busy === "reject"}
             disabled={!!busy}
-            className="inline-flex items-center gap-2 rounded-xl border border-[var(--color-border-strong)] bg-[var(--color-surface)] px-4 py-2.5 text-[13px] font-semibold text-rose-600 dark:text-rose-400 transition hover:bg-rose-500/10 active:scale-[0.98] disabled:opacity-60"
+            icon={<XIcon className="h-4 w-4" />}
+            onClick={() => act("reject")}
           >
-            {busy === "reject" ? <SpinnerIcon className="w-4 h-4 animate-spin" /> : <XIcon className="w-4 h-4" />}
             Reject
-          </button>
-          <span className="ml-auto text-[11px] text-[var(--color-faint)]">
+          </Button>
+          <span className="ml-auto text-[12.5px] text-[var(--color-faint)]">
             Reject sends a safe handoff message · edits override the draft
           </span>
         </div>

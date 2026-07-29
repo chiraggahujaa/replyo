@@ -24,7 +24,7 @@ import logging
 from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Header, HTTPException, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -43,6 +43,7 @@ from app.tenancy import (
     tenant_by_public_key,
     tenant_for_user,
 )
+from app.widget_config import cache_get, cache_put, sanitize_widget_config
 
 logger = logging.getLogger("replyo.api")
 
@@ -93,6 +94,39 @@ class RevalidatingStaticFiles(StaticFiles):
         resp = super().file_response(*args, **kwargs)
         resp.headers["Cache-Control"] = "no-cache"
         return resp
+
+
+# Public appearance config for the embeddable widget. The tenant's Install-page
+# customization (name + styling) is served by public key so a plain src+data-tenant
+# tag follows the console; data-* attributes on the tag still win per field. MUST be
+# registered BEFORE the /widget static mount below — Starlette matches routes in
+# order, so the mount would otherwise swallow this path with a 404.
+@app.get("/widget/config")
+async def widget_config(response: Response, tenant_key: str | None = None) -> dict:
+    # Per-tenant JSON must never be heuristically cached by a shared cache/CDN — the
+    # same class of staleness RevalidatingStaticFiles below defends the script against.
+    # (The in-process cache_get/cache_put layer is the cheap path instead.)
+    response.headers["Cache-Control"] = "no-store"
+
+    cache_key = tenant_key or ""
+    hit, cached = cache_get(cache_key)
+    if hit:
+        if cached is None:
+            raise HTTPException(status_code=404, detail="Unknown tenant key")
+        return cached
+
+    try:
+        tenant = await _resolve_tenant_key(tenant_key)
+    except HTTPException as e:
+        if e.status_code == 404:
+            cache_put(cache_key, None)  # unknown keys mustn't cost a DB trip per probe
+        raise
+    cfg = sanitize_widget_config(tenant.get("widget_config") or {})
+    # Only whitelisted appearance keys leave the server; the header title falls back
+    # to the persona's name so an uncustomized widget still greets correctly.
+    payload = {"name": cfg.pop("name", None) or tenant["name"], **cfg}
+    cache_put(cache_key, payload)
+    return payload
 
 
 # The embeddable chat widget. One drop-in script, served cross-origin to any site
@@ -165,6 +199,17 @@ async def _resolve_tenant_key(tenant_key: str | None) -> dict:
     return tenant
 
 
+# What a visitor sees when the owner paused the persona in the console. Delivered as a
+# normal reply (not an HTTP error) so every client — widget HTTP fallback, websocket,
+# curl — shows something human instead of a generic "couldn't reach us" note.
+PAUSED_REPLY = "Thanks for reaching out! We're not taking new chat messages right now — please check back later."
+
+
+def _is_paused(tenant: dict) -> bool:
+    # .get(): rows read before the status migration ran carry no key -> active.
+    return tenant.get("status") == "paused"
+
+
 async def get_active_tenant(
     user: User = Depends(get_current_user), x_tenant_id: str = Header(..., alias="X-Tenant-Id")
 ) -> dict:
@@ -178,6 +223,10 @@ async def chat(req: ChatRequest) -> ChatResponse:
     # another tenant's conversation. chat_id == thread: neither web nor api has a push
     # target, so held replies surface by polling /chat/{thread_id}/messages instead.
     tenant = await _resolve_tenant_key(req.tenant_key)
+    if _is_paused(tenant):
+        # Nothing is written (no graph turn, no follow-up) — the conversation simply
+        # doesn't advance while the persona is paused.
+        return ChatResponse(intent=None, reply=PAUSED_REPLY, held=False)
     thread = scoped_thread(str(tenant["id"]), req.thread_id)
     result = await handle_inbound(
         app.state.graph,
@@ -241,9 +290,8 @@ async def ws_chat(ws: WebSocket, thread_id: str, tenant_key: str | None = None) 
     server -> client:  sync | typing | token | message | error
 
     Tokens stream as the reply is generated, then a trailing `message` event carries
-    the authoritative text — the two can differ on purpose: answer_from_docs appends a
-    `Sources:` footer, and an escalated turn replies with a holding message rather than
-    the draft that's awaiting approval.
+    the authoritative text — the two can differ on purpose: an escalated turn replies
+    with a holding message rather than the draft that's awaiting approval.
 
     Registering with the hub is what lets out-of-band messages (a human approval, a
     48h nudge from the worker process) arrive on this same socket.
@@ -270,6 +318,21 @@ async def ws_chat(ws: WebSocket, thread_id: str, tenant_key: str | None = None) 
                 continue
             text = (data.get("text") or "").strip()
             if not text:
+                continue
+
+            # Re-check lifecycle every turn: the socket outlives console changes, so a
+            # pause (or delete) must bite on the visitor's next message, not their next
+            # page load. Refreshing `tenant` also picks up live prompt/name edits.
+            current = await get_tenant(str(tenant["id"]))
+            if current is None:
+                await ws.send_json({"type": "error", "message": "This assistant is no longer available."})
+                await ws.close()
+                return  # finally still unregisters
+            tenant = current
+            if _is_paused(tenant):
+                await ws.send_json(
+                    {"type": "message", "role": "ai", "content": PAUSED_REPLY, "held": False, "intent": None}
+                )
                 continue
 
             await ws.send_json({"type": "typing"})

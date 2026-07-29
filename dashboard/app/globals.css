@@ -1,36 +1,78 @@
 @import "tailwindcss";
 
-/* ---- Design tokens ---------------------------------------------------- */
+/* `dark:` utilities follow the explicit toggle (the inline script in layout.tsx always
+   resolves the theme to a concrete data-theme="light|dark" before first paint). */
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+/* ---- Design tokens ----------------------------------------------------------------
+   Type scale used across every screen (px):
+     26 page titles (font-display) · 20 card/hero titles · 17 section titles
+     15 body · 14 secondary · 12.5 meta · 11 uppercase micro-labels
+   Radii: pills for buttons/badges · 16px inputs · 20-24px cards ("bubbly").
+   --on-success / --on-danger: ink for text sitting ON solid success/danger fills —
+   the fills flip between deep (light theme) and bright (dark theme), so white ink
+   only passes AA in one of them.
+------------------------------------------------------------------------------------ */
 :root {
-  --bg: #f6f7f9;
-  --bg-soft: #eceef2;
+  --bg: #f6f6fb;
+  --bg-soft: #efeff7;
   --surface: #ffffff;
-  --surface-2: #fbfbfd;
-  --border: #e6e8ee;
-  --border-strong: #d6d9e2;
-  --text: #14161d;
-  --text-muted: #646b7a;
-  --text-faint: #949aa8;
-  --accent: #6366f1;
-  --accent-ink: #4f46e5;
-  --ring: rgba(99, 102, 241, 0.35);
+  --surface-2: #fafaff;
+  --glass: rgba(255, 255, 255, 0.72);
+  --border: #e6e7f2;
+  --border-strong: #d5d7e8;
+  --text: #121422;
+  --text-muted: #5c6178;
+  --text-faint: #8d92a8;
+  --accent: #6d5ef2;
+  --accent-2: #a855f7;
+  --accent-3: #22d3ee;
+  --accent-ink: #5646e0;
+  --accent-wash: rgba(109, 94, 242, 0.09);
+  --ring: rgba(109, 94, 242, 0.35);
+  --glow: rgba(109, 94, 242, 0.28);
+  --success: #0b7a55;
+  --success-wash: rgba(16, 185, 129, 0.12);
+  --on-success: #ffffff;
+  --warning: #92400e;
+  --warning-wash: rgba(245, 158, 11, 0.13);
+  --danger: #e11d48;
+  --danger-wash: rgba(244, 63, 94, 0.1);
+  --on-danger: #ffffff;
+  --aurora-opacity: 0.5;
+  --grid-opacity: 0.5;
+  color-scheme: light;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #0a0b0f;
-    --bg-soft: #101218;
-    --surface: #14161d;
-    --surface-2: #171a22;
-    --border: #232733;
-    --border-strong: #2d3240;
-    --text: #eceef4;
-    --text-muted: #9aa1b1;
-    --text-faint: #6b7284;
-    --accent: #7c7ff2;
-    --accent-ink: #a5a7fb;
-    --ring: rgba(124, 127, 242, 0.4);
-  }
+[data-theme="dark"] {
+  --bg: #07080f;
+  --bg-soft: #0c0e19;
+  --surface: #111322;
+  --surface-2: #151829;
+  --glass: rgba(17, 19, 34, 0.66);
+  --border: #212439;
+  --border-strong: #2d3149;
+  --text: #edeffb;
+  --text-muted: #9ba1bd;
+  --text-faint: #676e8c;
+  --accent: #8b7cff;
+  --accent-2: #c084fc;
+  --accent-3: #38e0f8;
+  --accent-ink: #b0a6ff;
+  --accent-wash: rgba(139, 124, 255, 0.13);
+  --ring: rgba(139, 124, 255, 0.45);
+  --glow: rgba(139, 124, 255, 0.35);
+  --success: #34d399;
+  --success-wash: rgba(52, 211, 153, 0.14);
+  --on-success: #052e1f;
+  --warning: #fbbf24;
+  --warning-wash: rgba(251, 191, 36, 0.14);
+  --danger: #fb7185;
+  --danger-wash: rgba(251, 113, 133, 0.12);
+  --on-danger: #4c0519;
+  --aurora-opacity: 0.55;
+  --grid-opacity: 1;
+  color-scheme: dark;
 }
 
 @theme inline {
@@ -44,26 +86,40 @@
   --color-muted: var(--text-muted);
   --color-faint: var(--text-faint);
   --color-accent: var(--accent);
+  --color-accent-2: var(--accent-2);
   --color-accent-ink: var(--accent-ink);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-danger: var(--danger);
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
+  --font-display: var(--font-space-grotesk);
 }
 
+/* ---- Base ------------------------------------------------------------------------ */
 * {
   border-color: var(--border);
 }
 
-html,
-body {
+html {
   height: 100%;
+  background: var(--bg);
+  transition: background 0.35s ease;
 }
 
 body {
-  background: var(--bg);
+  min-height: 100%;
+  background: transparent; /* html paints --bg so the fixed aurora can sit between them */
   color: var(--text);
   font-family: var(--font-sans), ui-sans-serif, system-ui, sans-serif;
+  font-size: 15px;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
+  transition: color 0.35s ease;
+}
+
+.font-display {
+  font-family: var(--font-display), var(--font-sans), ui-sans-serif, system-ui, sans-serif;
 }
 
 ::selection {
@@ -86,21 +142,242 @@ body {
   background-clip: padding-box;
 }
 
-@keyframes fade-in {
-  from { opacity: 0; transform: translateY(4px); }
-  to { opacity: 1; transform: translateY(0); }
+/* ---- Aurora backdrop (rendered once in layout.tsx) ------------------------------- */
+.aurora {
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  overflow: hidden;
+  pointer-events: none;
+  opacity: var(--aurora-opacity);
+  transition: opacity 0.5s ease;
 }
-.animate-in { animation: fade-in 0.22s ease-out both; }
+.aurora::before,
+.aurora::after {
+  content: "";
+  position: absolute;
+  width: 55vmax;
+  height: 55vmax;
+  border-radius: 50%;
+  filter: blur(90px);
+  will-change: transform;
+}
+.aurora::before {
+  top: -22vmax;
+  left: -12vmax;
+  background: radial-gradient(circle at center, var(--accent) 0%, transparent 62%);
+  opacity: 0.5;
+  animation: aurora-a 26s ease-in-out infinite alternate;
+}
+.aurora::after {
+  bottom: -25vmax;
+  right: -15vmax;
+  background: radial-gradient(circle at 40% 40%, var(--accent-2) 0%, var(--accent-3) 45%, transparent 70%);
+  opacity: 0.36;
+  animation: aurora-b 32s ease-in-out infinite alternate;
+}
+@keyframes aurora-a {
+  from { transform: translate3d(0, 0, 0) scale(1); }
+  50%  { transform: translate3d(9vmax, 6vmax, 0) scale(1.12); }
+  to   { transform: translate3d(3vmax, 10vmax, 0) scale(0.94); }
+}
+@keyframes aurora-b {
+  from { transform: translate3d(0, 0, 0) scale(1); }
+  50%  { transform: translate3d(-8vmax, -5vmax, 0) scale(1.08); }
+  to   { transform: translate3d(-3vmax, -11vmax, 0) scale(1.15); }
+}
+/* Faint futuristic grid, fading out toward the bottom. */
+.aurora-grid {
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  opacity: calc(0.05 * var(--grid-opacity));
+  background-image:
+    linear-gradient(var(--text) 1px, transparent 1px),
+    linear-gradient(90deg, var(--text) 1px, transparent 1px);
+  background-size: 44px 44px;
+  mask-image: radial-gradient(ellipse 90% 60% at 50% 0%, black 30%, transparent 75%);
+}
+
+/* ---- Reusable surfaces ----------------------------------------------------------- */
+.glass {
+  background: var(--glass);
+  backdrop-filter: blur(18px) saturate(1.4);
+  -webkit-backdrop-filter: blur(18px) saturate(1.4);
+}
+
+/* Gradient text: accent → accent-2 only. The cyan --accent-3 stop lives in the aurora,
+   not in text — it drops below 3:1 on light backgrounds. */
+.text-gradient {
+  background: linear-gradient(120deg, var(--accent) 0%, var(--accent-2) 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+/* Fixed hexes (not theme accents): both stops keep white 14px text >= 4.5:1 AA in BOTH
+   themes — the dark-theme accents are too bright to sit under white text. */
+.bg-cta {
+  background-image: linear-gradient(135deg, #6558ee 0%, #9333ea 100%);
+}
+
+/* Registered as utilities so hover:/focus: variants compose with them. */
+@utility glow-accent {
+  box-shadow: 0 8px 28px -8px var(--glow);
+}
+@utility glow-accent-lg {
+  box-shadow: 0 0 20px -2px var(--glow), 0 18px 44px -12px var(--glow);
+}
+
+/* Card lift on hover */
+.card-hover {
+  transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.25s ease, border-color 0.25s ease;
+}
+.card-hover:hover {
+  transform: translateY(-2px);
+  border-color: var(--border-strong);
+  box-shadow: 0 12px 32px -14px var(--glow);
+}
+
+/* ---- Motion ---------------------------------------------------------------------- */
+@keyframes fade-up {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.animate-in {
+  animation: fade-up 0.45s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@keyframes scale-in {
+  from { opacity: 0; transform: scale(0.94) translateY(6px); }
+  to   { opacity: 1; transform: scale(1) translateY(0); }
+}
+.animate-pop {
+  animation: scale-in 0.35s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+/* Stagger direct children: pair with .animate-in / .animate-pop on the children. */
+.stagger > * { animation-fill-mode: both; }
+.stagger > *:nth-child(1)  { animation-delay: 0.03s; }
+.stagger > *:nth-child(2)  { animation-delay: 0.07s; }
+.stagger > *:nth-child(3)  { animation-delay: 0.11s; }
+.stagger > *:nth-child(4)  { animation-delay: 0.15s; }
+.stagger > *:nth-child(5)  { animation-delay: 0.19s; }
+.stagger > *:nth-child(6)  { animation-delay: 0.23s; }
+.stagger > *:nth-child(7)  { animation-delay: 0.27s; }
+.stagger > *:nth-child(8)  { animation-delay: 0.31s; }
+.stagger > *:nth-child(9)  { animation-delay: 0.35s; }
+.stagger > *:nth-child(10) { animation-delay: 0.39s; }
+.stagger > *:nth-child(n + 11) { animation-delay: 0.42s; }
 
 @keyframes toast-in {
-  from { opacity: 0; transform: translateY(10px) scale(0.98); }
-  to { opacity: 1; transform: translateY(0) scale(1); }
+  from { opacity: 0; transform: translateY(14px) scale(0.95); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
 }
-.animate-toast { animation: toast-in 0.24s cubic-bezier(0.16, 1, 0.3, 1) both; }
+.animate-toast {
+  animation: toast-in 0.3s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@keyframes shimmer {
+  from { background-position: 200% 0; }
+  to   { background-position: -200% 0; }
+}
+.shimmer {
+  background: linear-gradient(
+    100deg,
+    var(--bg-soft) 40%,
+    var(--border) 50%,
+    var(--bg-soft) 60%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.6s linear infinite;
+}
 
 @keyframes pulse-ring {
-  0% { box-shadow: 0 0 0 0 var(--ring); }
-  70% { box-shadow: 0 0 0 5px transparent; }
+  0%   { box-shadow: 0 0 0 0 var(--ring); }
+  70%  { box-shadow: 0 0 0 6px transparent; }
   100% { box-shadow: 0 0 0 0 transparent; }
 }
-.live-dot { animation: pulse-ring 2s infinite; }
+.live-dot {
+  animation: pulse-ring 2s infinite;
+}
+
+/* Splash: orbiting halo + breathing logo */
+@keyframes splash-breathe {
+  0%, 100% { transform: scale(1); box-shadow: 0 0 34px -4px var(--glow); }
+  50%      { transform: scale(1.07); box-shadow: 0 0 58px 2px var(--glow); }
+}
+.splash-mark {
+  animation: splash-breathe 2.1s ease-in-out infinite;
+}
+@keyframes orbit {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+.splash-orbit {
+  animation: orbit 2.6s linear infinite;
+}
+@keyframes splash-bar {
+  from { transform: translateX(-100%); }
+  to   { transform: translateX(260%); }
+}
+.splash-bar {
+  animation: splash-bar 1.3s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+/* Animated gradient sweep for hero text */
+@keyframes gradient-pan {
+  0%   { background-position: 0% 50%; }
+  50%  { background-position: 100% 50%; }
+  100% { background-position: 0% 50%; }
+}
+.text-gradient-animated {
+  background: linear-gradient(
+    110deg,
+    var(--accent) 0%,
+    var(--accent-2) 35%,
+    var(--accent) 70%,
+    var(--accent-2) 100%
+  );
+  background-size: 220% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: gradient-pan 7s ease-in-out infinite;
+}
+
+@keyframes float-y {
+  0%, 100% { transform: translateY(0); }
+  50%      { transform: translateY(-6px); }
+}
+.animate-float {
+  animation: float-y 4.5s ease-in-out infinite;
+}
+
+/* Typing dots (chat-style loading) */
+@keyframes typing-bounce {
+  0%, 60%, 100% { transform: translateY(0); opacity: 0.4; }
+  30%           { transform: translateY(-4px); opacity: 1; }
+}
+.typing-dot {
+  animation: typing-bounce 1.2s ease-in-out infinite;
+}
+.typing-dot:nth-child(2) { animation-delay: 0.15s; }
+.typing-dot:nth-child(3) { animation-delay: 0.3s; }
+
+/* Reduced motion (macOS: System Settings > Accessibility > Reduce Motion) silences
+   DECORATIVE animation — entrances, floats, aurora drift, gradient pans, pulses.
+   Functional status indicators are exempted via :not(): a loading spinner, typing
+   dots, and the splash progress must keep moving, or "loading" reads as "hung". */
+@media (prefers-reduced-motion: reduce) {
+  *:not(.animate-spin, .typing-dot, .splash-orbit, .splash-bar),
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-delay: 0ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    transition-delay: 0ms !important;
+  }
+}

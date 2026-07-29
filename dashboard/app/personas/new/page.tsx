@@ -5,6 +5,14 @@ import { useState } from "react";
 import { createPersona, generatePrompt, updatePersona } from "@/lib/api";
 import { Shell } from "../../components/Shell";
 import { KnowledgeManager } from "../../components/KnowledgeManager";
+import { Button, Card, PageHeader, TextArea, TextInput, TypingDots } from "../../components/ui";
+import {
+  ArrowRightIcon,
+  CheckIcon,
+  CodeIcon,
+  RefreshIcon,
+  WandIcon,
+} from "../../components/icons";
 import { useReplyo } from "../../providers";
 
 export default function NewPersonaPage() {
@@ -29,7 +37,7 @@ function Wizard() {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
-  async function createStep(e: React.FormEvent) {
+  async function createStep(e: React.SubmitEvent<HTMLFormElement>) {
     e.preventDefault();
     setBusy(true);
     setErr(null);
@@ -81,142 +89,189 @@ function Wizard() {
 
   return (
     <div className="mx-auto w-full max-w-2xl px-6 py-8">
-      <h1 className="text-[20px] font-semibold tracking-tight">New persona</h1>
+      <PageHeader title="New persona" />
 
-      {/* Stepper */}
-      <div className="mt-5 mb-7 flex items-center gap-2">
+      {/* Stepper — connected progress rail */}
+      <div className="animate-in mb-8 mt-6 flex items-start">
         {STEPS.map((s, i) => (
-          <div key={s} className="flex items-center gap-2">
-            <div
-              className={`grid h-6 w-6 place-items-center rounded-full text-[11px] font-bold ${
-                i < step
-                  ? "bg-emerald-500 text-white"
-                  : i === step
-                    ? "bg-[var(--color-accent)] text-white"
-                    : "bg-[var(--color-surface)] border border-[var(--color-border)] text-[var(--color-faint)]"
-              }`}
-            >
-              {i < step ? "✓" : i + 1}
+          <div key={s} className={`flex items-start ${i < STEPS.length - 1 ? "flex-1" : ""}`}>
+            <div className="flex flex-col items-center gap-1.5">
+              <div
+                className={`grid h-7 w-7 place-items-center rounded-full text-[11px] font-bold transition-all duration-300 ${
+                  i < step
+                    ? "bg-[var(--color-success)] text-[var(--on-success)]"
+                    : i === step
+                      ? "scale-110 bg-cta text-white glow-accent"
+                      : "border border-[var(--color-border)] bg-[var(--color-surface)] text-[var(--color-faint)]"
+                }`}
+              >
+                {i < step ? <CheckIcon className="h-3.5 w-3.5" /> : i + 1}
+              </div>
+              <span
+                className={`text-[12.5px] ${
+                  i === step
+                    ? "font-semibold text-[var(--color-text)]"
+                    : i < step
+                      ? "text-[var(--color-muted)]"
+                      : "text-[var(--color-faint)]"
+                }`}
+              >
+                {s}
+              </span>
             </div>
-            <span className={`text-[12.5px] ${i === step ? "font-semibold" : "text-[var(--color-faint)]"}`}>{s}</span>
-            {i < STEPS.length - 1 && <div className="w-6 h-px bg-[var(--color-border)]" />}
+            {i < STEPS.length - 1 && (
+              <div
+                className={`mx-2 mt-[13px] h-0.5 flex-1 rounded-full transition-all duration-500 ${
+                  i < step ? "bg-[var(--color-success)]" : "bg-[var(--color-border)]"
+                }`}
+              />
+            )}
           </div>
         ))}
       </div>
 
-      {err && <p className="mb-4 text-[12.5px] text-rose-500">{err}</p>}
+      {err && <p className="animate-in mb-4 text-[13px] text-[var(--color-danger)]">{err}</p>}
 
       {/* Step 0 — name */}
       {step === 0 && (
-        <form onSubmit={createStep} className="rounded-2xl border border-[var(--color-border)] bg-[var(--color-surface)] p-6">
-          <label className="text-[13px] font-semibold">What&apos;s the business called?</label>
-          <input
-            autoFocus
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            placeholder="e.g. BrightSmile Dental"
-            className="mt-2 w-full rounded-xl border border-[var(--color-border-strong)] bg-[var(--color-surface)] px-3.5 py-2.5 text-[14px] outline-none focus:border-[var(--color-accent)] focus:ring-2 focus:ring-[var(--ring)]"
-          />
-          <button
-            disabled={busy || !name.trim()}
-            className="mt-4 rounded-xl bg-[var(--color-accent)] px-5 py-2.5 text-[13.5px] font-semibold text-white hover:opacity-90 disabled:opacity-60"
-          >
-            {busy ? "Creating…" : "Continue"}
-          </button>
-        </form>
+        <Card className="animate-pop p-7">
+          <form onSubmit={createStep}>
+            <label className="text-[14px] font-semibold">What&apos;s the business called?</label>
+            <TextInput
+              autoFocus
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="Your business name"
+              className="mt-2.5"
+            />
+            <Button
+              loading={busy}
+              disabled={!name.trim()}
+              icon={<ArrowRightIcon className="h-4 w-4" />}
+              className="mt-5"
+            >
+              Continue
+            </Button>
+          </form>
+        </Card>
       )}
 
       {/* Step 1 — knowledge + notes */}
       {step === 1 && tenantId && (
-        <div className="space-y-5">
+        <div className="animate-pop space-y-6">
           <div>
-            <h2 className="text-[15px] font-semibold">Feed it knowledge</h2>
-            <p className="mt-1 text-[12.5px] text-[var(--color-faint)]">
+            <h2 className="font-display text-[17px] font-semibold tracking-tight">
+              Feed it knowledge
+            </h2>
+            <p className="mt-1.5 text-[14px] text-[var(--color-muted)]">
               Upload documents and add your website — we&apos;ll deep-crawl it. Add several important URLs if there are
               deep pages a crawler might miss. Ingestion runs in the background; you can continue.
             </p>
           </div>
           <KnowledgeManager tenantId={tenantId} />
           <div>
-            <label className="text-[13px] font-semibold">Anything else? (optional)</label>
-            <p className="text-[12px] text-[var(--color-faint)]">Tone, offers, things not written down anywhere.</p>
-            <textarea
+            <label className="text-[14px] font-semibold">Anything else? (optional)</label>
+            <p className="mt-0.5 text-[12.5px] text-[var(--color-faint)]">
+              Tone, offers, things not written down anywhere.
+            </p>
+            <TextArea
               value={notes}
               onChange={(e) => setNotes(e.target.value)}
               rows={3}
-              placeholder="e.g. Friendly and fast. Emphasise same-day emergencies. Never quote for gas fitting."
-              className="mt-1.5 w-full resize-none rounded-xl border border-[var(--color-border-strong)] bg-[var(--color-surface)] px-3.5 py-2.5 text-[13.5px] outline-none focus:border-[var(--color-accent)]"
+              placeholder="Anything the assistant should know or keep in mind…"
+              className="mt-2 resize-none"
             />
           </div>
           <div className="flex justify-end">
-            <button
+            <Button
               onClick={() => {
                 setStep(2);
                 if (!prompt) generate();
               }}
-              className="rounded-xl bg-[var(--color-accent)] px-5 py-2.5 text-[13.5px] font-semibold text-white hover:opacity-90"
+              icon={<WandIcon className="h-4 w-4" />}
             >
               Generate prompt
-            </button>
+            </Button>
           </div>
         </div>
       )}
 
       {/* Step 2 — prompt */}
       {step === 2 && (
-        <div className="space-y-4">
+        <div className="animate-pop space-y-5">
           <div>
-            <h2 className="text-[15px] font-semibold">Review the assistant&apos;s instructions</h2>
-            <p className="mt-1 text-[12.5px] text-[var(--color-faint)]">
+            <h2 className="font-display text-[17px] font-semibold tracking-tight">
+              Review the assistant&apos;s instructions
+            </h2>
+            <p className="mt-1.5 text-[14px] text-[var(--color-muted)]">
               We generated this from your knowledge and notes. It&apos;s combined with your documents at answer time —
               edit anything that reads wrong.
             </p>
           </div>
-          <textarea
-            value={prompt}
-            onChange={(e) => setPrompt(e.target.value)}
-            rows={14}
-            placeholder={busy ? "Generating…" : "The system prompt will appear here."}
-            className="w-full resize-y rounded-xl border border-[var(--color-border-strong)] bg-[var(--color-surface)] px-3.5 py-3 text-[13px] leading-relaxed outline-none focus:border-[var(--color-accent)] font-mono"
-          />
+          {/* The textarea stays mounted during generation (disabled + overlay) so focus
+              isn't lost and a failed generation degrades back to an editable field. */}
+          <div className="relative">
+            <TextArea
+              value={prompt}
+              onChange={(e) => setPrompt(e.target.value)}
+              rows={14}
+              disabled={busy && !prompt}
+              placeholder="The system prompt will appear here."
+              className="resize-y font-mono text-[13.5px]"
+            />
+            {busy && !prompt && (
+              <div className="glass absolute inset-0 flex items-center justify-center gap-3 rounded-2xl">
+                <TypingDots className="text-[var(--color-accent)]" />
+                <span className="text-[14px] text-[var(--color-muted)]">
+                  Writing your assistant&apos;s instructions…
+                </span>
+              </div>
+            )}
+          </div>
           <div className="flex items-center justify-between">
-            <button onClick={generate} disabled={busy} className="text-[12.5px] font-medium text-[var(--color-accent)] hover:underline disabled:opacity-60">
-              ↻ Regenerate
-            </button>
-            <button
-              onClick={save}
-              disabled={busy || !prompt.trim()}
-              className="rounded-xl bg-emerald-600 px-5 py-2.5 text-[13.5px] font-semibold text-white hover:bg-emerald-500 disabled:opacity-60"
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={generate}
+              loading={busy}
+              icon={<RefreshIcon className="h-3.5 w-3.5" />}
             >
-              {busy ? "Saving…" : "Save & finish"}
-            </button>
+              Regenerate
+            </Button>
+            <Button
+              variant="success"
+              onClick={save}
+              loading={busy}
+              disabled={!prompt.trim()}
+              icon={<CheckIcon className="h-4 w-4" />}
+            >
+              Save &amp; finish
+            </Button>
           </div>
         </div>
       )}
 
       {/* Step 3 — done */}
       {step === 3 && (
-        <div className="rounded-2xl border border-[var(--color-border)] bg-[var(--color-surface)] p-8 text-center">
-          <div className="mx-auto grid h-12 w-12 place-items-center rounded-2xl bg-emerald-500 text-white text-[20px]">✓</div>
-          <h2 className="mt-4 text-[17px] font-semibold tracking-tight">{name} is live</h2>
-          <p className="mt-1 text-[13px] text-[var(--color-faint)]">
+        <Card className="animate-pop p-9 text-center">
+          <div className="animate-float mx-auto grid h-14 w-14 place-items-center rounded-[20px] bg-[var(--color-success)] text-[var(--on-success)] shadow-[0_0_28px_-4px_var(--success)]">
+            <CheckIcon className="h-7 w-7" />
+          </div>
+          <h2 className="mt-5 font-display text-[20px] font-semibold tracking-tight">
+            {name} is live
+          </h2>
+          <p className="mt-1.5 text-[14px] text-[var(--color-muted)]">
             Grab your embed snippet and test the assistant against your own knowledge.
           </p>
-          <div className="mt-5 flex justify-center gap-2.5">
-            <button
-              onClick={() => router.push("/install")}
-              className="rounded-xl bg-[var(--color-accent)] px-5 py-2.5 text-[13.5px] font-semibold text-white hover:opacity-90"
-            >
-              Get the snippet & test it
-            </button>
-            <button
-              onClick={() => router.push("/")}
-              className="rounded-xl border border-[var(--color-border-strong)] bg-[var(--color-surface)] px-5 py-2.5 text-[13.5px] font-semibold hover:bg-[var(--color-bg-soft)]"
-            >
+          <div className="mt-6 flex justify-center gap-2.5">
+            <Button onClick={() => router.push("/install")} icon={<CodeIcon className="h-4 w-4" />}>
+              Get the snippet
+            </Button>
+            <Button variant="secondary" onClick={() => router.push("/queue")}>
               Go to queue
-            </button>
+            </Button>
           </div>
-        </div>
+        </Card>
       )}
     </div>
   );

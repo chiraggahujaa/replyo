@@ -614,11 +614,11 @@ def answer_from_docs(state: ConversationState, config: RunnableConfig) -> dict:
         "Answer the customer's question USING ONLY the context below. If the answer is not "
         "clearly in the context, say you don't have that information on hand and offer to "
         "have the team follow up — do NOT guess or invent prices, policies, or availability. "
-        "Cite the sources you used inline like [1], [2]. Keep it concise.\n\n"
+        "Do not mention the context, sources, or citation numbers in your reply. "
+        "Keep it concise.\n\n"
         f"Context:\n{context}"
     )
     ai = _reply(state, instructions, config=config, temperature=0.1)
 
-    # Append a human-friendly Sources footer so it shows in any channel.
-    reply = f"{ai.content}\n\nSources: {', '.join(sources)}"
-    return {"messages": [AIMessage(content=reply)], "citations": sources}
+    # Sources are tracked as citations metadata but no longer shown in the reply text.
+    return {"messages": [AIMessage(content=ai.content)], "citations": sources}
