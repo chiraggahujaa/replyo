@@ -120,6 +120,7 @@ type WidgetConfig = {
   position: PositionId;
   offsetX: number;
   offsetY: number;
+  attachments: boolean; // image uploads in the composer; the widget defaults to on
 };
 
 function defaultConfig(personaName: string): WidgetConfig {
@@ -135,6 +136,7 @@ function defaultConfig(personaName: string): WidgetConfig {
     position: "bottom-right",
     offsetX: DEFAULT_OFFSET,
     offsetY: DEFAULT_OFFSET,
+    attachments: true,
   };
 }
 
@@ -180,6 +182,7 @@ function mergeConfig(defaults: WidgetConfig, stored?: Partial<WidgetConfig>): Wi
   m.height = clampNum(m.height, MIN_H, MAX_H, defaults.height);
   m.offsetX = clampNum(m.offsetX, 0, MAX_OFFSET, defaults.offsetX);
   m.offsetY = clampNum(m.offsetY, 0, MAX_OFFSET, defaults.offsetY);
+  if (typeof m.attachments !== "boolean") m.attachments = defaults.attachments;
   return m;
 }
 
@@ -221,6 +224,8 @@ function buildAttrs(cfg: WidgetConfig, personaName: string, publicKey: string, p
   if (pinAll || cfg.position !== "bottom-right") attrs.push(["data-position", cfg.position]);
   if (pinAll || cfg.offsetX !== DEFAULT_OFFSET) attrs.push(["data-offset-x", String(cfg.offsetX)]);
   if (pinAll || cfg.offsetY !== DEFAULT_OFFSET) attrs.push(["data-offset-y", String(cfg.offsetY)]);
+  if (pinAll || cfg.attachments !== true)
+    attrs.push(["data-attachments", cfg.attachments ? "on" : "off"]);
   return attrs;
 }
 
@@ -627,6 +632,27 @@ function Install() {
                 for exact dimensions ({MIN_W}–{MAX_W} px wide, {MIN_H}–{MAX_H} px tall).
               </p>
             )}
+          </Card>
+
+          {/* Attachments */}
+          <Card className="animate-in p-5">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="min-w-0">
+                <SectionLabel>Attachments</SectionLabel>
+                <p className="mt-1 text-[13px] text-[var(--color-faint)]">
+                  Let visitors attach images to their messages — shown as a paperclip next to
+                  Send.
+                </p>
+              </div>
+              <Segmented
+                value={value.attachments ? "on" : "off"}
+                onChange={(v) => patch({ attachments: v === "on" })}
+                options={[
+                  { value: "on" as const, label: "On" },
+                  { value: "off" as const, label: "Off" },
+                ]}
+              />
+            </div>
           </Card>
 
           {/* Position */}

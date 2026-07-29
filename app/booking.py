@@ -13,8 +13,8 @@ conflict flow is unit-testable without OpenAI or Google.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime, timedelta
-from typing import Callable, Optional
 from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, Field
@@ -74,7 +74,7 @@ def snap_to_clinic(target: datetime, now: datetime, tz: ZoneInfo):
 
 
 def find_available(after: datetime, tz: ZoneInfo, calendar: CalendarBackend,
-                   count: int = 3, exclude: Optional[set[datetime]] = None):
+                   count: int = 3, exclude: set[datetime] | None = None):
     """Return up to `count` free (start, end) slots on/after `after`."""
     exclude = exclude or set()
     out = []
@@ -102,7 +102,7 @@ WEEKDAYS = {
 
 class ParsedTime(BaseModel):
     understood: bool = Field(description="True if a concrete date+time could be determined.")
-    start_iso: Optional[str] = Field(
+    start_iso: str | None = Field(
         None, description="The chosen appointment start as ISO 8601 with timezone offset."
     )
 
@@ -111,17 +111,17 @@ class _TimeIntent(BaseModel):
     """What the LLM extracts — no date math, no ISO formatting."""
 
     understood: bool = Field(description="True if a day and time can be determined.")
-    option_index: Optional[int] = Field(
+    option_index: int | None = Field(
         None, description="1-based index if the patient picked a previously offered option."
     )
-    day: Optional[str] = Field(
+    day: str | None = Field(
         None, description="One of: monday..sunday, or 'today', or 'tomorrow'. For 'this weekend' use 'saturday'."
     )
-    hour: Optional[int] = Field(None, description="Hour in 24h (0-23). morning=10, afternoon=15, evening=18.")
-    minute: Optional[int] = Field(0, description="Minute 0-59.")
+    hour: int | None = Field(None, description="Hour in 24h (0-23). morning=10, afternoon=15, evening=18.")
+    minute: int | None = Field(0, description="Minute 0-59.")
 
 
-def _compute_date(day: str, hour: int, minute: int, now: datetime, tz: ZoneInfo) -> Optional[datetime]:
+def _compute_date(day: str, hour: int, minute: int, now: datetime, tz: ZoneInfo) -> datetime | None:
     today = now.date()
     day = day.lower().strip()
     if day == "today":
@@ -141,7 +141,7 @@ def _compute_date(day: str, hour: int, minute: int, now: datetime, tz: ZoneInfo)
 
 
 def parse_requested_time(
-    user_text: str, *, now: datetime, tz: ZoneInfo, options: Optional[list[str]] = None
+    user_text: str, *, now: datetime, tz: ZoneInfo, options: list[str] | None = None
 ) -> ParsedTime:
     """Turn the user's message into one concrete start datetime (Python does the math)."""
     model = get_chat_model(temperature=0.0).with_structured_output(_TimeIntent)
@@ -216,8 +216,8 @@ def try_book(
     calendar: CalendarBackend,
     user_text: str,
     *,
-    now: Optional[datetime] = None,
-    parse: Optional[ParseFn] = None,
+    now: datetime | None = None,
+    parse: ParseFn | None = None,
 ) -> dict:
     """Attempt to book from a ready booking_info by parsing a time out of `user_text`.
 

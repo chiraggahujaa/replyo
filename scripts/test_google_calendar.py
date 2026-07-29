@@ -12,10 +12,15 @@ Run:  uv run python scripts/test_google_calendar.py
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime
 
-from app.booking import CLINIC_HOURS, DURATION, clinic_tz, format_slot
-from app.booking import _compute_date  # noqa: internal helper reused for expected values
+from app.booking import (
+    CLINIC_HOURS,
+    DURATION,
+    _compute_date,  # internal helper reused for expected values
+    clinic_tz,
+    format_slot,
+)
 from app.calendar import get_calendar
 from app.graph.build import graph_with_checkpointer, run_turn
 
@@ -146,7 +151,7 @@ async def scenario_conflict(graph):
 
 async def scenario_vague(graph):
     print("\n\033[1m6) Vague time -> asks to specify, does not misbook\033[0m")
-    b1 = await say(graph, "gc-vague", "I'd like to book an appointment, I'm Alex, 98450 01313")
+    await say(graph, "gc-vague", "I'd like to book an appointment, I'm Alex, 98450 01313")
     b2 = await say(graph, "gc-vague", "whenever suits you, you decide", reset=False)
     check("did not confirm a vague time", b2.get("status") != "confirmed", str(b2))
     check("no event created for vague time", not b2.get("event_id"))

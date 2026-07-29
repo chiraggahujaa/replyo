@@ -7,6 +7,7 @@ without touching the graph nodes.
 from __future__ import annotations
 
 from langchain_openai import ChatOpenAI
+from pydantic import SecretStr
 
 from app.config import settings
 
@@ -19,6 +20,6 @@ def get_chat_model(temperature: float = 0.3) -> ChatOpenAI:
     """
     return ChatOpenAI(
         model=settings.openai_model,
-        api_key=settings.openai_api_key,
+        api_key=SecretStr(settings.openai_api_key),
         temperature=temperature,
     )

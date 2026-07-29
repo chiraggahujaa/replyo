@@ -7,6 +7,8 @@ Endpoints:
                                      fallback when a websocket can't be opened)
   WS   /ws/chat/{id}              -> live chat: streams reply tokens, and pushes
                                      approved replies / follow-up nudges
+  WS   /ws/admin                  -> dashboard change feed: pushes "queue/knowledge
+                                     changed" signals so the console needn't poll
   GET  /reviews                   -> list pending human-review items
   GET  /reviews/{id}              -> one review (with conversation + draft)
   POST /reviews/{id}/decision     -> approve/edit/reject; resumes the graph and
@@ -20,14 +22,21 @@ Run:  uvicorn app.api:app --reload
 
 from __future__ import annotations
 
+import asyncio
+import base64
+import binascii
 import logging
+import re
+import time
+import uuid
 from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Response, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app import realtime, reviews
 from app.admin_api import router as admin_router
@@ -42,6 +51,7 @@ from app.tenancy import (
     get_tenant,
     tenant_by_public_key,
     tenant_for_user,
+    verify_token,
 )
 from app.widget_config import cache_get, cache_put, sanitize_widget_config
 
@@ -147,12 +157,106 @@ app.include_router(whatsapp_router)
 app.include_router(admin_router)
 
 
+# Bounds for image attachments on POST /chat. HTTP-only by design: a photo's data URL
+# blows past the widget's ~1MB websocket frame budget, so the widget sends any turn
+# that carries images through this endpoint even while its socket is open. The regex
+# whitelists the media types the vision model accepts and rejects anything that isn't
+# pure base64 — a data URL is otherwise an arbitrary-bytes smuggling vector.
+MAX_IMAGES_PER_MESSAGE = 4
+MAX_IMAGE_CHARS = 1_500_000  # per data-URL string
+MAX_IMAGES_TOTAL_CHARS = 4_000_000  # all images in one message combined
+IMAGE_DATA_URL = re.compile(r"^data:image/(png|jpeg|webp|gif);base64,([A-Za-z0-9+/=]+)$")
+
+# File signatures per declared subtype. Shape alone isn't enough: a well-formed data
+# URL wrapping 1.5MB of base64 garbage would sail through to the model provider, whose
+# rejection is then OUR failure. The decoded bytes must open with the signature of the
+# subtype the URL declares. webp is positional (RIFF container: "RIFF" at 0, "WEBP" at
+# 8) and is handled separately in the validator.
+IMAGE_MAGIC_BYTES = {
+    "png": (b"\x89PNG\r\n\x1a\n",),
+    "jpeg": (b"\xff\xd8\xff",),
+    "gif": (b"GIF87a", b"GIF89a"),
+}
+
+# Pydantic's image caps only bite AFTER Starlette has buffered and JSON-parsed the
+# whole body — a ~280MB POST is fully materialized in memory before the len>4 check
+# can 422 it. The declared Content-Length is checked here, before a byte of body is
+# read. The limit is the images budget (MAX_IMAGES_TOTAL_CHARS of base64) plus JSON
+# framing/text overhead. Scoped to POST /chat only: it is the one unauthenticated
+# endpoint that legitimately accepts multi-megabyte payloads, and other routes must
+# not inherit a limit tuned to image attachments.
+MAX_CHAT_BODY_BYTES = 6_500_000
+
+
+@app.middleware("http")
+async def limit_chat_body(request: Request, call_next):
+    if request.method == "POST" and request.url.path == "/chat":
+        # This middleware is registered after CORSMiddleware, which makes it the
+        # OUTERMOST layer — short-circuit responses never pass back through CORS
+        # processing, so they must carry the allow-origin header themselves or the
+        # cross-origin widget sees an opaque network error instead of the detail.
+        cors = {"Access-Control-Allow-Origin": "*"}
+        declared = request.headers.get("content-length")
+        if declared is None:
+            # No declared length (e.g. chunked) means the size can't be bounded
+            # without reading the body — exactly what this guard must never do.
+            return JSONResponse(status_code=411, content={"detail": "Content-Length required"}, headers=cors)
+        try:
+            length = int(declared)
+        except ValueError:
+            length = MAX_CHAT_BODY_BYTES + 1  # unparseable declares nothing -> reject
+        if length > MAX_CHAT_BODY_BYTES:
+            return JSONResponse(status_code=413, content={"detail": "Request body too large"}, headers=cors)
+    return await call_next(request)
+
+
 class ChatRequest(BaseModel):
     thread_id: str = Field(..., description="Conversation id; reuse it to continue a chat.")
     message: str = Field(..., description="The user's inbound message.")
     tenant_key: str | None = Field(
         None, description="The persona's public key (from the widget's data-tenant). Omit to use the demo persona."
     )
+    images: list[str] = Field(
+        default_factory=list,
+        description="Optional image attachments, each a data:image/...;base64 URL.",
+    )
+
+    @field_validator("images")
+    @classmethod
+    def _valid_images(cls, images: list[str]) -> list[str]:
+        if len(images) > MAX_IMAGES_PER_MESSAGE:
+            raise ValueError(f"At most {MAX_IMAGES_PER_MESSAGE} images per message")
+        for img in images:
+            # Length before regex: never run a pattern over an unbounded string.
+            if len(img) > MAX_IMAGE_CHARS:
+                raise ValueError("Image too large")
+            m = IMAGE_DATA_URL.fullmatch(img)
+            if not m:
+                raise ValueError("Images must be data:image/(png|jpeg|webp|gif);base64 URLs")
+            subtype, payload = m.group(1), m.group(2)
+            # The payload must be real base64 AND real image bytes of the DECLARED
+            # subtype — validation is the last stop before these bytes are uploaded
+            # to the model provider, and a provider rejection surfaces as our error.
+            try:
+                raw = base64.b64decode(payload, validate=True)
+            except binascii.Error:
+                raise ValueError("Image payload is not valid base64") from None
+            if subtype == "webp":
+                ok = raw[:4] == b"RIFF" and raw[8:12] == b"WEBP"
+            else:
+                ok = raw.startswith(IMAGE_MAGIC_BYTES[subtype])
+            if not ok:
+                raise ValueError(f"Image bytes do not match the declared image/{subtype} type")
+        if sum(len(img) for img in images) > MAX_IMAGES_TOTAL_CHARS:
+            raise ValueError("Combined images too large")
+        return images
+
+    @model_validator(mode="after")
+    def _text_or_images(self) -> ChatRequest:
+        # An image can stand alone, but a turn must carry SOMETHING for the graph.
+        if not self.message.strip() and not self.images:
+            raise ValueError("message must not be empty unless images are attached")
+        return self
 
 
 class ChatResponse(BaseModel):
@@ -223,19 +327,33 @@ async def chat(req: ChatRequest) -> ChatResponse:
     # another tenant's conversation. chat_id == thread: neither web nor api has a push
     # target, so held replies surface by polling /chat/{thread_id}/messages instead.
     tenant = await _resolve_tenant_key(req.tenant_key)
+    # The widget hides its attach button when the tenant disabled attachments, but the
+    # endpoint is public — a hand-crafted POST must not buy vision-model input the
+    # owner turned off. Absent key = enabled (the contract default); only an explicit
+    # False in the sanitized config blocks.
+    if req.images and sanitize_widget_config(tenant.get("widget_config") or {}).get("attachments") is False:
+        raise HTTPException(status_code=400, detail="Attachments are disabled for this assistant")
     if _is_paused(tenant):
         # Nothing is written (no graph turn, no follow-up) — the conversation simply
         # doesn't advance while the persona is paused.
         return ChatResponse(intent=None, reply=PAUSED_REPLY, held=False)
     thread = scoped_thread(str(tenant["id"]), req.thread_id)
-    result = await handle_inbound(
-        app.state.graph,
-        tenant=tenant,
-        thread_id=thread,
-        channel=_channel_for(req.thread_id),
-        chat_id=thread,
-        text=req.message,
-    )
+    # Same failure contract as the websocket path: a graph/provider error must reach
+    # the widget as a polite, retryable upstream failure, never a bare 500 traceback.
+    try:
+        result = await handle_inbound(
+            app.state.graph,
+            tenant=tenant,
+            thread_id=thread,
+            channel=_channel_for(req.thread_id),
+            chat_id=thread,
+            text=req.message,
+            images=req.images or None,
+        )
+    except Exception:
+        # The cause is already in the log line above; the 502 replaces it on purpose.
+        logger.exception("Chat turn failed for %s", req.thread_id)
+        raise HTTPException(status_code=502, detail="Sorry — something went wrong. Please try again.") from None
     return ChatResponse(
         intent=result["intent"],
         reply=result["reply"],
@@ -249,17 +367,40 @@ async def chat(req: ChatRequest) -> ChatResponse:
 
 
 async def _transcript(thread_id: str) -> list[dict]:
-    """The thread's conversation, in the same {role, content} shape the dashboard uses."""
+    """The thread's conversation, in the same {role, content} shape the dashboard uses.
+
+    Image turns are stored as multimodal content blocks (see run_turn); the widget
+    contract keeps "content" plain text ALWAYS, with the data URLs split out under
+    "images". Text-only messages keep the exact historical shape — no "images" key —
+    because the widget treats an absent key as "no attachments".
+    """
     snapshot = await app.state.graph.aget_state({"configurable": {"thread_id": thread_id}})
-    return [
-        {"role": m.type, "content": m.content}
-        for m in (snapshot.values or {}).get("messages", [])
-        if getattr(m, "type", None) in ("human", "ai")
-    ]
+    out: list[dict] = []
+    for m in (snapshot.values or {}).get("messages", []):
+        if getattr(m, "type", None) not in ("human", "ai"):
+            continue
+        if isinstance(m.content, list):
+            out.append(
+                {
+                    "role": m.type,
+                    "content": "\n".join(
+                        b.get("text") or "" for b in m.content
+                        if isinstance(b, dict) and b.get("type") == "text"
+                    ).strip(),
+                    "images": [
+                        b["image_url"]["url"] for b in m.content
+                        if isinstance(b, dict) and b.get("type") == "image_url"
+                        and isinstance(b.get("image_url"), dict) and b["image_url"].get("url")
+                    ],
+                }
+            )
+        else:
+            out.append({"role": m.type, "content": m.content})
+    return out
 
 
 @app.get("/chat/{thread_id}/messages")
-async def chat_messages(thread_id: str, tenant_key: str | None = None) -> dict:
+async def chat_messages(thread_id: str, tenant_key: str | None = None, known: int | None = None) -> dict:
     """Return the conversation transcript for a WEB thread, scoped to its tenant.
 
     The websocket is the primary transport; this endpoint restores history on page load
@@ -276,6 +417,11 @@ async def chat_messages(thread_id: str, tenant_key: str | None = None) -> dict:
         raise HTTPException(status_code=404, detail="Not found")
     tenant = await _resolve_tenant_key(tenant_key)
     messages = await _transcript(scoped_thread(str(tenant["id"]), thread_id))
+    # `known` = how many messages the caller already holds. The widget polls this
+    # every 4s while its socket is down, and image turns ride inline as base64 — an
+    # unchanged transcript must cost a count, not megabytes, per tick.
+    if known == len(messages):
+        return {"count": len(messages)}
     return {"messages": messages, "count": len(messages)}
 
 
@@ -374,6 +520,103 @@ async def ws_chat(ws: WebSocket, thread_id: str, tenant_key: str | None = None) 
         realtime.hub.unregister(thread, ws)
 
 
+# How long a fresh admin socket gets to present its auth frame before we hang up.
+ADMIN_WS_AUTH_TIMEOUT = 10
+# Application-level heartbeat. Protocol pings don't reach browser JS, so the client
+# can't tell a half-open TCP connection (laptop sleep, network switch) from a quiet
+# one — it watches for these frames and abandons a socket that goes silent.
+ADMIN_WS_PING_INTERVAL = 25
+
+
+@app.websocket("/ws/admin")
+async def ws_admin(ws: WebSocket) -> None:
+    """Live change feed for the dashboard (review queue + knowledge ingestion).
+
+    Browsers can't set an Authorization header on a WebSocket, so the FIRST frame
+    authenticates — a message rather than a query param keeps the token out of URLs
+    and access logs:
+
+        client -> server:  {"type": "auth", "token": "<supabase jwt>", "tenant_id": "..."}
+        server -> client:  {"type": "ready"}
+        server -> client:  {"type": "change", "topic": "reviews" | "knowledge", ...}
+
+    Events originate from Postgres triggers (see the admin_change_notify migration)
+    and arrive via the same hub the chat sockets use. They are invalidation signals
+    only — no row data crosses this socket. The client refetches over the
+    authenticated HTTP API, so RLS still decides what it can actually see, and a
+    socket that outlives a revoked membership can leak nothing but "something changed".
+
+    Close codes: 4401 = bad/expired token (reconnect with a fresh one),
+    4403 = not a member of that persona (reconnecting won't help).
+    """
+    await ws.accept()
+    key: str | None = None
+    try:
+        try:
+            async with asyncio.timeout(ADMIN_WS_AUTH_TIMEOUT):
+                first = await ws.receive_json()
+        # Silent client, a non-JSON frame, or a binary frame (receive_json reads the
+        # "text" key, so a bytes frame surfaces as KeyError rather than ValueError).
+        except (TimeoutError, ValueError, KeyError):
+            await ws.close(code=4401)
+            return
+        if not isinstance(first, dict) or first.get("type") != "auth":
+            await ws.close(code=4401)
+            return
+
+        try:
+            claims = verify_token(str(first.get("token") or ""))
+        except HTTPException:
+            await ws.close(code=4401)
+            return
+        sub = claims.get("sub")
+        if not sub:
+            await ws.close(code=4401)
+            return
+
+        tenant_id = str(first.get("tenant_id") or "")
+        try:
+            uuid.UUID(tenant_id)  # malformed ids would surface as DB errors below
+        except ValueError:
+            await ws.close(code=4403)
+            return
+        try:
+            # The same membership chokepoint every dashboard HTTP route goes through.
+            tenant = await tenant_for_user(User(id=sub, email=claims.get("email")), tenant_id)
+        except HTTPException:
+            await ws.close(code=4403)
+            return
+
+        key = realtime.admin_key(str(tenant["id"]))
+        realtime.hub.register(key, ws)
+        await ws.send_json({"type": "ready"})
+
+        # Hold the socket open until the token would expire, ignoring any client
+        # chatter; the hub pushes events the whole time. A quiet stretch gets a
+        # heartbeat frame instead — the client's staleness watchdog depends on them,
+        # and the send doubles as our own probe of a dead TCP path. Closing at exp
+        # forces a reconnect-with-fresh-token, so a signed-out browser's feed dies
+        # with its session instead of living forever.
+        deadline = float(claims.get("exp") or 0) or (time.time() + 3600)
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            try:
+                async with asyncio.timeout(min(remaining, ADMIN_WS_PING_INTERVAL)):
+                    await ws.receive_text()
+            except TimeoutError:
+                await ws.send_json({"type": "ping"})
+        await ws.close(code=4401)
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        logger.exception("Admin websocket closed unexpectedly")
+    finally:
+        if key is not None:
+            realtime.hub.unregister(key, ws)
+
+
 @app.get("/reviews")
 async def list_reviews(tenant: dict = Depends(get_active_tenant)) -> list[dict]:
     return await reviews.list_pending(tenant_id=str(tenant["id"]))
@@ -397,19 +640,37 @@ async def decide(
     row = await reviews.get_review(review_id, tenant_id=tenant_id)
     if not row:
         raise HTTPException(status_code=404, detail="Review not found")
-    if row["status"] != "pending":
-        raise HTTPException(status_code=409, detail="Review already resolved")
     if decision.action not in ("approve", "edit", "reject"):
         raise HTTPException(status_code=400, detail="action must be approve|edit|reject")
+    if row["status"] != "pending":
+        raise HTTPException(status_code=409, detail="Review already resolved")
 
-    # Resume the paused graph with the human's decision -> final reply.
-    final = await resume_review(
-        app.state.graph, row["thread_id"], {"action": decision.action, "text": decision.text}
-    )
+    # Claim the row BEFORE resuming the graph. The claim's own `status = 'pending'`
+    # guard is the concurrency control: two staff deciding the same review at once
+    # (likelier now that escalations push to every open dashboard) race the UPDATE,
+    # exactly one wins, and the loser gets the same 409 as the check above.
+    if not await reviews.claim_pending(review_id, tenant_id=tenant_id, decision=decision.action):
+        raise HTTPException(status_code=409, detail="Review already resolved")
+
+    try:
+        # Resume the paused graph with the human's decision -> final reply.
+        final = await resume_review(
+            app.state.graph, row["thread_id"], {"action": decision.action, "text": decision.text}
+        )
+    except Exception:
+        # Nothing reached the customer yet, so releasing the claim makes a retry safe.
+        await reviews.release_claim(review_id, tenant_id=tenant_id)
+        raise
     # Deliver to the customer on their original channel. Telegram/WhatsApp get a push;
     # the web widget has no push address, so the message is broadcast to any socket it
     # has open (and is in the transcript regardless, for whenever it reconnects).
-    await send_to_channel(row["channel"], row.get("chat_id"), final)
+    try:
+        await send_to_channel(row["channel"], row.get("chat_id"), final)
+    except Exception:
+        # The graph is already resumed and the reply is in the transcript, so
+        # un-resolving here would invite a double-resume — the very race the claim
+        # exists to prevent. Keep the row resolved and surface the delivery failure.
+        logger.exception("Delivery failed for review %s on %s", review_id, row["channel"])
     await realtime.publish_message(row["thread_id"], final, source="approval")
-    await reviews.mark_resolved(review_id, tenant_id=tenant_id, decision=decision.action, final_text=final)
+    await reviews.store_final(review_id, tenant_id=tenant_id, final_text=final)
     return {"status": "resolved", "final_reply": final}

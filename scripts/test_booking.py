@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 
 from langchain_core.messages import AIMessage
 
@@ -79,7 +78,7 @@ def test_try_book_unit():
 def test_clinic_hours():
     print("\n\033[1m2) Clinic-hours slot generation\033[0m")
     now = datetime.now(TZ)
-    slots = [s for s, _ in zip((s for s, _ in iter_slots(now, TZ)), range(300))]
+    slots = [s for s, _ in zip((s for s, _ in iter_slots(now, TZ)), range(300), strict=False)]
     # No slot before 09:30 on Mon–Sat, none in Sunday afternoon (Sun closes 14:00).
     bad_early = [s for s in slots if s.weekday() <= 5 and (s.hour, s.minute) < (9, 30)]
     bad_sunday = [s for s in slots if s.weekday() == 6 and s.hour >= 14]
@@ -91,7 +90,7 @@ def test_clinic_hours():
 
 def _stub_llm():
     """Stub triage->booking_request and extraction returning full slots; replies echo."""
-    from app.graph.nodes import TriageResult, BookingExtraction
+    from app.graph.nodes import BookingExtraction, TriageResult
 
     class FS:
         def __init__(s, o): s.o = o
@@ -113,6 +112,7 @@ def _stub_llm():
 async def run_node_flow():
     print("\n\033[1m3) handle_booking flow — book, conflict, pick alternative\033[0m")
     from langgraph.checkpoint.memory import MemorySaver
+
     from app.graph.build import build_graph, run_turn
 
     now = datetime.now(TZ)
@@ -149,6 +149,7 @@ async def run_node_flow():
 async def run_reschedule_flow():
     print("\n\033[1m4) handle_booking flow — reschedule + confirmed acknowledgement\033[0m")
     from langgraph.checkpoint.memory import MemorySaver
+
     from app.graph.build import build_graph, run_turn
 
     now = datetime.now(TZ)

@@ -122,7 +122,10 @@ inbound message ──▶ web widget  or  Telegram bot  or  WhatsApp  ──▶ 
 
 `/chat` returns `intent`, `reply`, `held`, `review_id`, `lead_info`, `booking_info`, `citations`, and
 `needs_human`. When a message is escalated, `held` is `true`, `reply` is the holding message, and `review_id`
-points at the queued item; the real reply goes out only once a human approves it.
+points at the queued item; the real reply goes out only once a human approves it. The request may
+also carry `images` — a list of `data:image/…;base64,` URLs (max 4 per message, ~1.5 MB each,
+~4 MB combined) — passed to the model as multimodal input; `message` may be empty when images are
+present.
 
 ## Setup
 
@@ -169,6 +172,27 @@ points at the queued item; the real reply goes out only once a human approves it
    4. In `.env` set `GOOGLE_SERVICE_ACCOUNT_FILE=./service-account.json`,
       `GOOGLE_CALENDAR_ID=<your calendar id>` (often your Google email), and `CLINIC_TIMEZONE`.
 
+## Checks (lint, types, CI)
+
+Tooling is pinned as dev dependencies (`uv sync` installs it), configured in
+`pyproject.toml`, and enforced three ways — the same commands everywhere, so a clean
+local run means a green pipeline:
+
+```bash
+uv run ruff check .              # Python lint  (config: [tool.ruff])
+uv run pyright                   # Python types (config: [tool.pyright]; Pylance's engine)
+cd dashboard && npm run lint     # eslint — same for clinic-site/
+uv run pre-commit run --all-files  # everything, across the whole repo
+```
+
+- **Pre-commit** (`.pre-commit-config.yaml`, install once with `uv run pre-commit install`):
+  hygiene hooks (whitespace, EOF, broken YAML/TOML/JSON, merge markers, stray private
+  keys, oversized files) + `ruff --fix` + eslint on the staged files of each Next.js app.
+- **GitHub Actions** (`.github/workflows/ci.yml`): three jobs on every push/PR — backend
+  (`uv sync --frozen`, ruff, pyright, an import smoke test), dashboard and clinic-site
+  (eslint, `tsc --noEmit`, production build). No secrets needed; `uv.lock` is committed
+  so CI installs are reproducible.
+
 ## Run
 
 **API (curl-testable):**
@@ -201,7 +225,12 @@ API, with nothing Next.js-specific about it:
 ```
 It keeps a `web:<uuid>` thread in `localStorage` (history survives reloads), talks over a
 **websocket** for live token-by-token replies, and falls back to `POST /chat` + polling
-`GET /chat/{id}/messages` if the socket can't be established.
+`GET /chat/{id}/messages` if the socket can't be established. Visitors can attach images
+(sent as data URLs over `POST /chat`, never the socket); add `data-attachments="off"` to the
+tag to disable the paperclip — like every appearance field it defaults on and is also
+configurable from the console's Install page, with the explicit attribute winning. The header's
+`⋮` menu offers **Reset conversation** (client-side: mints a fresh thread, nothing is deleted
+server-side) and **Download transcript** (a plain-text `.txt` of the chat).
 
 **Telegram bot (long-polling, no public URL needed):**
 ```bash
@@ -215,10 +244,14 @@ cd dashboard
 npm install          # first time only
 npm run dev          # http://localhost:3000
 ```
-The dashboard polls the API's `/reviews` endpoints (point it elsewhere via `NEXT_PUBLIC_API_URL` in
-`dashboard/.env.local` if the API isn't on `localhost:8000`). Send the bot a complaint, watch it land in the
-queue, then **approve / edit / reject** — the final reply is delivered back to that Telegram chat. The
-`pending_reviews` table comes from the migration you applied in setup (`supabase db push`).
+The dashboard follows the queue live over a **websocket** (`/ws/admin` — Postgres triggers NOTIFY on
+every `pending_reviews`/`knowledge_sources` write, and the API pushes a "changed" signal to the
+console, which refetches over HTTP), degrading to polling the `/reviews` endpoints if a socket can't
+be opened (point it elsewhere via `NEXT_PUBLIC_API_URL` in `dashboard/.env.local` if the API isn't on
+`localhost:8000`). Send the bot a complaint, watch it land in the queue instantly, then
+**approve / edit / reject** — the final reply is delivered back to that Telegram chat. The
+`pending_reviews` table and the notify triggers come from the migrations you applied in setup
+(`supabase db push`).
 
 **Follow-up worker (Step 7):**
 ```bash
@@ -282,10 +315,10 @@ app/
     whatsapp.py        # WhatsApp webhook: verify handshake, parse_inbound(), retry dedup
   static/
     widget.js          # embeddable chat widget (Shadow DOM, websocket + HTTP fallback)
-  realtime.py          # Postgres LISTEN/NOTIFY hub -> pushes to open widget sockets
+  realtime.py          # Postgres LISTEN/NOTIFY hub -> pushes to widget + dashboard sockets
 data/                  # clinic documents (pricing, services, policies, hours)
 clinic-site/           # Next.js clinic website (embeds the widget; content from data/)
-dashboard/             # Next.js approval dashboard (review-queue UI, polls the API)
+dashboard/             # Next.js approval dashboard (live over websocket, polls as fallback)
 supabase/
   migrations/          # SQL migrations for app-owned tables (pending_reviews, …)
 scripts/

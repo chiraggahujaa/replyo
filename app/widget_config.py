@@ -69,6 +69,12 @@ def sanitize_widget_config(raw: object) -> dict:
     if isinstance(color, str) and HEX_COLOR.fullmatch(color):
         out["color"] = color.lower()
 
+    # "attachments" is a plain on/off toggle, not an enum — only a real JSON boolean
+    # passes (absent means the widget's default, so no key is ever synthesised here).
+    attachments = raw.get("attachments")
+    if isinstance(attachments, bool):
+        out["attachments"] = attachments
+
     for key, lo, hi in (
         ("width", MIN_W, MAX_W),
         ("height", MIN_H, MAX_H),

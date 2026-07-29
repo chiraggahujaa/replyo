@@ -47,6 +47,8 @@
  *                                         overrides the preset dimension(s)
  *       data-position="bottom-right|bottom-left|top-right|top-left"
  *       data-offset-x / data-offset-y     px from the chosen corner, clamped 0–200
+ *       data-attachments="on|off"         image attach button in the composer
+ *                                         ("true"/"false" also accepted; default on)
  */
 (function () {
   "use strict";
@@ -85,21 +87,25 @@
   const MAX_BACKOFF = 15000;
 
   // One stable thread per browser + persona, so a returning visitor keeps their history.
+  function mintUuid() {
+    return window.crypto && crypto.randomUUID
+      ? crypto.randomUUID()
+      : String(Date.now()) + Math.random().toString(16).slice(2);
+  }
+
   function threadId() {
     let id = localStorage.getItem(STORAGE_KEY);
     if (!id) {
-      const uuid = window.crypto && crypto.randomUUID
-        ? crypto.randomUUID()
-        : String(Date.now()) + Math.random().toString(16).slice(2);
       // Just a random handle; the server binds it to this persona's tenant, so the
       // client never needs (or is trusted with) the tenant id in the thread itself.
-      id = "web:" + uuid;
+      id = "web:" + mintUuid();
       localStorage.setItem(STORAGE_KEY, id);
     }
     return id;
   }
 
-  const THREAD = threadId();
+  // Mutable: "Reset conversation" mints a fresh id mid-session (resetConversation below).
+  let thread = threadId();
 
   // ---------- appearance config (all optional; defaults = the original look) ----------
 
@@ -215,6 +221,10 @@
     position: ds.position && own.call(POSITIONS, ds.position) ? ds.position : null,
     offsetX: intOrNull(ds.offsetX, 0, 200),
     offsetY: intOrNull(ds.offsetY, 0, 200),
+    // "on"/"off" (or "true"/"false") pins the composer's image-attach button; any
+    // other value counts as absent so the server config keeps deciding.
+    attachments: ds.attachments === "on" || ds.attachments === "true" ? true
+      : ds.attachments === "off" || ds.attachments === "false" ? false : null,
   };
 
   // Merge tag attributes over the server config into one concrete appearance. `srv`
@@ -242,6 +252,8 @@
     const position = pick(attr.position, srv.position && own.call(POSITIONS, srv.position) ? srv.position : null) || "bottom-right";
     const offX = pick(attr.offsetX, intOrNull(srv.offsetX, 0, 200));
     const offY = pick(attr.offsetY, intOrNull(srv.offsetY, 0, 200));
+    // Boolean, so pick()'s null-checks (never ||) are what keep an explicit false alive.
+    const attach = pick(attr.attachments, typeof srv.attachments === "boolean" ? srv.attachments : null);
     return {
       // Set as textContent below — never interpolated into HTML — so a tenant name
       // can't inject markup onto the host page.
@@ -256,6 +268,7 @@
       position: position,
       offX: offX != null ? offX : 20,
       offY: offY != null ? offY : 20,
+      attachments: attach != null ? attach : true,
     };
   }
 
@@ -316,6 +329,20 @@
     .dot.off { background: #fbbf24; }
     .close { background: transparent; border: 0; color: ${ink}; cursor: pointer; font-size: 21px; line-height: 1; opacity: .85; }
     .close:hover { opacity: 1; }
+    .tools { display: flex; align-items: center; gap: 2px; }
+    .menu-btn { background: transparent; border: 0; color: ${ink}; cursor: pointer; font-size: 18px; line-height: 1; opacity: .85; padding: 2px 5px; }
+    .menu-btn:hover { opacity: 1; }
+    .menu {
+      position: absolute; top: 56px; right: 12px; z-index: 5; min-width: 190px;
+      background: ${mode.panelBg}; color: ${mode.text}; border: 1px solid ${mode.border};
+      border-radius: 10px; box-shadow: ${mode.shadow}; padding: 4px; display: none;
+    }
+    .menu.open { display: block; }
+    .menu-item {
+      display: block; width: 100%; text-align: left; background: transparent; border: 0;
+      color: ${mode.text}; font-size: 13px; padding: 8px 11px; border-radius: 7px; cursor: pointer;
+    }
+    .menu-item:hover { background: ${mode.logBg}; }
     .log { flex: 1; overflow-y: auto; padding: 14px; display: flex; flex-direction: column; gap: 8px; background: ${mode.logBg}; }
     .msg { max-width: 84%; padding: 9px 12px; border-radius: 14px; font-size: 13.5px; line-height: 1.5; white-space: pre-wrap; word-wrap: break-word; }
     .ai { align-self: flex-start; background: ${mode.aiBg}; border: 1px solid ${mode.aiBorder}; border-top-left-radius: 5px; }
@@ -331,6 +358,26 @@
     .input:focus { border-color: ${theme.b}; box-shadow: 0 0 0 3px ${theme.ring}; }
     .send { border: 0; border-radius: 10px; padding: 0 15px; background: ${theme.deep}; color: #fff; font-size: 13.5px; font-weight: 600; cursor: pointer; }
     .send:disabled { opacity: .5; cursor: default; }
+    .attach {
+      flex: none; width: 38px; border: 1px solid ${mode.inputBorder}; border-radius: 10px;
+      background: ${mode.inputBg}; color: ${mode.note}; cursor: pointer; display: grid; place-items: center;
+    }
+    .attach:hover, .attach:focus { border-color: ${theme.b}; outline: none; }
+    .attach:focus { box-shadow: 0 0 0 3px ${theme.ring}; }
+    .attach:disabled { opacity: .5; cursor: default; }
+    ${A.attachments ? "" : ".attach { display: none; }"}
+    .file { display: none; }
+    .strip { display: none; flex-wrap: wrap; gap: 6px; padding: 8px 10px 0; background: ${mode.panelBg}; border-top: 1px solid ${mode.border}; }
+    .strip.show { display: flex; }
+    .chip { position: relative; width: 48px; height: 48px; border-radius: 8px; overflow: hidden; border: 1px solid ${mode.inputBorder}; flex: none; }
+    .chip img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .chip-x {
+      position: absolute; top: 2px; right: 2px; width: 16px; height: 16px; border-radius: 50%;
+      border: 0; background: rgba(15,23,42,.65); color: #fff; font-size: 11px; line-height: 1;
+      padding: 0; cursor: pointer; display: grid; place-items: center;
+    }
+    .msg img { max-width: 100%; border-radius: 10px; display: block; }
+    .msg img.gap { margin-top: 6px; }
     .typing span { display: inline-block; animation: blink 1.4s infinite both; }
     .typing span:nth-child(2) { animation-delay: .2s; }
     .typing span:nth-child(3) { animation-delay: .4s; }
@@ -361,12 +408,27 @@
           <div class="title"></div>
           <div class="sub"><span class="dot"></span><span class="status">Online</span></div>
         </div>
-        <button class="close" aria-label="Close chat">&times;</button>
+        <div class="tools">
+          <button class="menu-btn" aria-label="Chat menu" aria-haspopup="true" aria-expanded="false">⋮</button>
+          <button class="close" aria-label="Close chat">&times;</button>
+        </div>
       </header>
+      <div class="menu">
+        <button class="menu-item menu-reset" type="button">Reset conversation</button>
+        <button class="menu-item menu-download" type="button">Download transcript</button>
+      </div>
       <div class="log"></div>
+      <div class="strip"></div>
       <form class="form">
         <input class="input" type="text" placeholder="Ask about treatments, prices, booking…" autocomplete="off" />
+        <button class="attach" type="button" aria-label="Attach images">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"
+                  stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </button>
         <button class="send" type="submit">Send</button>
+        <input class="file" type="file" accept="image/*" multiple />
       </form>
     </section>
   `;
@@ -380,9 +442,16 @@
     badge: root.querySelector(".badge"),
     panel: root.querySelector(".panel"),
     close: root.querySelector(".close"),
+    menuBtn: root.querySelector(".menu-btn"),
+    menu: root.querySelector(".menu"),
+    menuReset: root.querySelector(".menu-reset"),
+    menuDownload: root.querySelector(".menu-download"),
     log: root.querySelector(".log"),
+    strip: root.querySelector(".strip"),
     form: root.querySelector(".form"),
     input: root.querySelector(".input"),
+    attach: root.querySelector(".attach"),
+    file: root.querySelector(".file"),
     send: root.querySelector(".send"),
     dot: root.querySelector(".dot"),
     status: root.querySelector(".status"),
@@ -404,8 +473,23 @@
   let known = 0;         // messages rendered, used to detect new ones when polling
   let unread = 0;
   let streamEl = null;   // the bubble currently being streamed into
+  // The streamed bubble's transcript-mirror entry, patched by handle — never by
+  // position: the visitor can submit a human turn mid-stream, so "last entry" is
+  // not guaranteed to be the streamed one.
+  let streamEntry = null;
   let typingEl = null;
   let destroyed = false; // set by teardown() so the socket never reconnects afterwards
+  // Bumped by resetConversation() and teardown(). Every async HTTP continuation
+  // captures it before awaiting and bails silently if it moved: a reply or
+  // transcript fetched for the old thread must never land in a log it no longer
+  // belongs to.
+  let epoch = 0;
+  let menuOpen = false;
+  const pendingImages = []; // downscaled data-URLs awaiting the next send, capped at 4
+  // Mirror of the rendered log ({role, content, images}) for "Download transcript":
+  // renderAll rebuilds it wholesale, addMessage appends, and the authoritative
+  // "message" event fixes up the streamed entry's text.
+  const transcript = [];
 
   // ---------- rendering ----------
 
@@ -432,12 +516,29 @@
     }
   }
 
-  function addMessage(role, content) {
+  // Transcript images round-trip through the server, so an <img> src is only ever set
+  // from a string that proves itself a base64 image data-URL — never trusted as-is.
+  const IMG_DATA_URL = /^data:image\/(png|jpe?g|webp|gif);base64,/;
+
+  function addMessage(role, content, images) {
     const div = document.createElement("div");
     div.className = "msg " + (role === "human" ? "human" : "ai");
     // Assistant replies may contain **bold**; the customer's own text is shown verbatim.
     if (role === "ai") setRich(div, content);
     else div.textContent = content;
+    const kept = [];
+    let follows = !!content; // an image after text (or another image) gets a top gap
+    (images || []).forEach((src) => {
+      if (typeof src !== "string" || !IMG_DATA_URL.test(src)) return;
+      const img = document.createElement("img");
+      if (follows) img.className = "gap";
+      follows = true;
+      img.alt = "attached image";
+      img.src = src;
+      div.appendChild(img);
+      kept.push(src);
+    });
+    transcript.push({ role: role, content: content, images: kept });
     els.log.appendChild(div);
     scroll();
     return div;
@@ -476,9 +577,11 @@
   function renderAll(messages) {
     els.log.innerHTML = "";
     streamEl = null;
+    streamEntry = null;
     typingEl = null;
+    transcript.length = 0; // addMessage repopulates it below, one entry per bubble
     if (!messages.length) showEmpty();
-    else messages.forEach((m) => addMessage(m.role, m.content));
+    else messages.forEach((m) => addMessage(m.role, m.content, m.images));
     known = messages.length;
     scroll();
   }
@@ -503,7 +606,7 @@
     let socket;
     try {
       const q = TENANT_KEY ? `?tenant_key=${encodeURIComponent(TENANT_KEY)}` : "";
-      socket = new WebSocket(`${WS_BASE}/ws/chat/${encodeURIComponent(THREAD)}${q}`);
+      socket = new WebSocket(`${WS_BASE}/ws/chat/${encodeURIComponent(thread)}${q}`);
     } catch (err) {
       startPolling();
       return;
@@ -552,18 +655,25 @@
           streamEl = addMessage("ai", "");
           streamEl.classList.add("cursor");
           streamEl._raw = "";
+          streamEntry = transcript[transcript.length - 1];
         }
         // Accumulate the raw stream and re-render, so **bold** formats as it arrives.
+        // The mirror entry tracks the raw text too, so a download mid-stream (or a
+        // "message" event that never lands) still carries what's on screen.
         streamEl._raw += msg.text;
         setRich(streamEl, streamEl._raw);
+        if (streamEntry) streamEntry.content = streamEl._raw;
         scroll();
         break;
 
       case "message": {
         clearTyping();
         if (streamEl) {
-          // Replace the streamed preview with the authoritative text.
+          // Replace the streamed preview with the authoritative text — in the
+          // transcript mirror too, via the entry's own handle.
           setRich(streamEl, msg.content);
+          if (streamEntry) streamEntry.content = msg.content;
+          streamEntry = null;
           streamEl.classList.remove("cursor");
           streamEl = null;
         } else {
@@ -584,7 +694,14 @@
 
       case "error":
         clearTyping();
+        // The bubble and its mirror entry go together — a removed stream must not
+        // leave a phantom line in the downloaded transcript.
         if (streamEl) { streamEl.remove(); streamEl = null; }
+        if (streamEntry) {
+          const i = transcript.indexOf(streamEntry);
+          if (i >= 0) transcript.splice(i, 1);
+          streamEntry = null;
+        }
         addNote(msg.message || "Something went wrong.");
         break;
     }
@@ -593,14 +710,22 @@
   // ---------- transport: http fallback ----------
 
   async function syncOverHttp() {
+    const gen = epoch; // a reset mid-fetch makes this the OLD thread's transcript
     try {
       const q = TENANT_KEY ? `?tenant_key=${encodeURIComponent(TENANT_KEY)}` : "";
-      const res = await fetch(`${API}/chat/${encodeURIComponent(THREAD)}/messages${q}`, { cache: "no-store" });
+      // `known` tells the server what we already render: when its count matches, it
+      // omits "messages" entirely, so an unchanged 4s poll never re-ships a
+      // transcript full of base64 images.
+      const res = await fetch(
+        `${API}/chat/${encodeURIComponent(thread)}/messages${q}${q ? "&" : "?"}known=${known}`,
+        { cache: "no-store" }
+      );
       if (!res.ok) return;
       const data = await res.json();
+      if (epoch !== gen) return;
       if (data.count !== known) {
         const grew = data.count - known;
-        renderAll(data.messages);
+        renderAll(data.messages || []);
         if (grew > 0) markUnread(grew);
       }
     } catch { /* next tick retries */ }
@@ -622,49 +747,218 @@
   // load, and by the console's Install page on unmount.
   function teardown() {
     destroyed = true;
+    epoch += 1; // strand any HTTP continuation still in flight
     stopPolling();
     if (ws) {
       try { ws.onclose = null; ws.onerror = null; ws.close(); } catch (e) { /* ignore */ }
       ws = null;
     }
+    // The menu's outside-click listener lives on the document, not in the shadow —
+    // it would leak (and hold this closure alive) if the host alone were removed.
+    document.removeEventListener("click", onDocClick);
     try { host.remove(); } catch (e) { /* ignore */ }
     if (window.__replyoWidget && window.__replyoWidget.host === host) window.__replyoWidget = null;
   }
-  window.__replyoWidget = { teardown, host, thread: THREAD, isOpen: function () { return open; } };
+  window.__replyoWidget = { teardown, host, thread: thread, isOpen: function () { return open; } };
 
   // ---------- sending ----------
 
-  async function send(text) {
-    addMessage("human", text);
+  async function send(text, images) {
+    // The bubble and its mirror entry are kept by handle so a failed image POST can
+    // unwind this optimistic turn; `gen` is captured before any await so a reset
+    // mid-flight makes every continuation below bail instead of touching the new
+    // thread's log.
+    const bubble = addMessage("human", text, images);
+    const mirror = transcript[transcript.length - 1];
     known += 1;
+    const gen = epoch;
 
-    if (ws && ws.readyState === WebSocket.OPEN) {
+    // Image turns skip the socket even when it's open: browsers cap WS frames well
+    // below what four data-URLs can weigh, so the WS protocol stays text-only and
+    // images always ride HTTP.
+    if (!images.length && ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: "user_message", text }));
       return;
     }
 
-    // Fallback: plain HTTP round-trip, no streaming.
+    // Image sends only: put everything back where it was — bubble and mirror entry
+    // out, count restored, text in the input, images on the strip — so one click
+    // retries the turn. The text-only fallback keeps its legacy behavior (bubble
+    // stays, note below the log).
+    const unwind = () => {
+      bubble.remove();
+      const i = transcript.indexOf(mirror);
+      if (i >= 0) transcript.splice(i, 1);
+      known -= 1;
+      // Restore the failed text only into an empty input — a draft the visitor
+      // typed while the request was in flight must not be overwritten.
+      if (text && !els.input.value) els.input.value = text;
+      pendingImages.push(...images);
+      renderStrip();
+    };
+
+    // Plain HTTP round-trip, no streaming.
     showTyping();
     els.send.disabled = true;
+    els.attach.disabled = true;
     try {
+      const body = { thread_id: thread, message: text, tenant_key: TENANT_KEY };
+      if (images.length) body.images = images;
       const res = await fetch(`${API}/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ thread_id: THREAD, message: text, tenant_key: TENANT_KEY }),
+        body: JSON.stringify(body),
       });
+      if (!res.ok && images.length) {
+        // Surface the server's own reason when it gives one — "Attachments are
+        // disabled for this assistant", a size rejection — but only a plain-string
+        // 4xx "detail", and only ever through addNote/textContent, never as HTML.
+        let detail = null;
+        if (res.status >= 400 && res.status < 500) {
+          try {
+            const err = await res.json();
+            if (err && typeof err.detail === "string") detail = err.detail;
+          } catch { /* body wasn't JSON — the generic note covers it */ }
+        }
+        if (epoch !== gen) return;
+        clearTyping();
+        unwind();
+        addNote(detail || "Couldn't reach the clinic just now — please try again.");
+        return;
+      }
       if (!res.ok) throw new Error("chat " + res.status);
       const data = await res.json();
+      if (epoch !== gen) return;
       clearTyping();
       addMessage("ai", data.reply);
       known += 1;
       if (data.held) addNote("A team member is reviewing your message…");
     } catch {
+      if (epoch !== gen) return;
       clearTyping();
+      if (images.length) unwind();
       addNote("Couldn't reach the clinic just now — please try again.");
     } finally {
       els.send.disabled = false;
+      els.attach.disabled = false;
       els.input.focus();
     }
+  }
+
+  // ---------- attachments ----------
+
+  const MAX_IMAGES = 4;  // mirrored server-side; extras are silently dropped
+  const MAX_EDGE = 1280; // longest side after downscale, keeps a 4-image turn in budget
+  // The server rejects images at 1_500_000 chars per data-URL and 4_000_000 combined
+  // per message. Both budgets are enforced HERE, at attach time, under those caps —
+  // a send must never be able to bounce off the server on size.
+  const MAX_IMG_CHARS = 1400000;   // per image, with headroom under the server's cap
+  const MAX_TOTAL_CHARS = 3800000; // all pending images together, same headroom
+  // Canvas export attempts, best first: [longest edge, JPEG quality]. Later rungs
+  // trade fidelity for fitting MAX_IMG_CHARS.
+  const EXPORTS = [[MAX_EDGE, 0.82], [1024, 0.7], [800, 0.6]];
+
+  function renderStrip() {
+    els.strip.innerHTML = "";
+    pendingImages.forEach((src, i) => {
+      const chip = document.createElement("div");
+      chip.className = "chip";
+      const img = document.createElement("img");
+      img.alt = "";
+      img.src = src; // produced locally by downscale(), never remote input
+      const rm = document.createElement("button");
+      rm.type = "button";
+      rm.className = "chip-x";
+      rm.setAttribute("aria-label", "Remove image");
+      rm.textContent = "×";
+      rm.addEventListener("click", () => { pendingImages.splice(i, 1); renderStrip(); });
+      chip.appendChild(img);
+      chip.appendChild(rm);
+      els.strip.appendChild(chip);
+    });
+    els.strip.classList.toggle("show", pendingImages.length > 0);
+  }
+
+  // Re-encode a selected image via canvas at the given longest edge / JPEG quality.
+  // A phone photo is ~10× the server's per-image cap as shipped; the resize is what
+  // keeps the POST acceptable. Resolves null for anything that won't decode or
+  // export (e.g. a tainted canvas).
+  function downscale(file, edge, quality) {
+    return new Promise((resolve) => {
+      const url = URL.createObjectURL(file);
+      const img = new Image();
+      img.onload = () => {
+        URL.revokeObjectURL(url);
+        const k = Math.min(1, edge / Math.max(img.width, img.height));
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.max(1, Math.round(img.width * k));
+        canvas.height = Math.max(1, Math.round(img.height * k));
+        canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
+        try { resolve(canvas.toDataURL("image/jpeg", quality)); } catch (e) { resolve(null); }
+      };
+      img.onerror = () => { URL.revokeObjectURL(url); resolve(null); };
+      img.src = url;
+    });
+  }
+
+  // ---------- header menu ----------
+
+  function setMenu(next) {
+    menuOpen = next;
+    els.menu.classList.toggle("open", menuOpen);
+    els.menuBtn.setAttribute("aria-expanded", menuOpen ? "true" : "false");
+  }
+
+  // Purely client-side: the old thread stays untouched server-side, this browser just
+  // stops pointing at it. The socket's handlers are detached before closing so its
+  // reconnect-with-backoff can't race the connection we open under the new id; the
+  // epoch bump does the same for HTTP — a POST /chat reply or a poll that resolves
+  // after this must not replay the old thread into the fresh log.
+  function resetConversation() {
+    epoch += 1;
+    localStorage.removeItem(STORAGE_KEY);
+    thread = threadId();
+    if (window.__replyoWidget && window.__replyoWidget.host === host) window.__replyoWidget.thread = thread;
+    if (ws) {
+      try { ws.onclose = null; ws.onerror = null; ws.close(); } catch (e) { /* ignore */ }
+      ws = null;
+    }
+    backoff = 1000;
+    pendingImages.length = 0;
+    renderStrip();
+    streamEl = null;
+    streamEntry = null;
+    clearTyping();
+    known = 0;
+    unread = 0;
+    els.badge.classList.remove("show");
+    transcript.length = 0;
+    showEmpty();
+    connect();
+  }
+
+  function downloadTranscript() {
+    const day = new Date().toISOString().slice(0, 10);
+    // Speaker lines are the format's only structure, so nothing untrusted may start
+    // one: the assistant name is stripped of CR/LF, and every continuation line of
+    // message content is indented off column 0 — model output can't forge "You: …".
+    const name = appearance.name.replace(/[\r\n]+/g, " ");
+    const lines = [name + " — chat transcript (" + day + ")", ""];
+    transcript.forEach((m) => {
+      if (!m.content && !m.images.length) return; // e.g. a stream no token reached yet
+      const label = m.role === "human" ? "You" : name;
+      const tag = m.images.length ? (m.content ? " [image attached]" : "[image attached]") : "";
+      lines.push(label + ": " + m.content.replace(/\r\n?|\n/g, "\n    ") + tag);
+    });
+    const blob = new Blob([lines.join("\n") + "\n"], { type: "text/plain" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "replyo-transcript-" + day + ".txt";
+    root.appendChild(a); // some browsers only honor download on in-document anchors
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
   }
 
   // ---------- wiring ----------
@@ -683,12 +977,61 @@
 
   els.bubble.addEventListener("click", () => toggle(!open));
   els.close.addEventListener("click", () => toggle(false));
+
+  els.menuBtn.addEventListener("click", () => setMenu(!menuOpen));
+  els.menuReset.addEventListener("click", () => { setMenu(false); resetConversation(); });
+  els.menuDownload.addEventListener("click", () => { setMenu(false); downloadTranscript(); });
+  // Clicks inside the shadow close the menu unless they land on it (or its button —
+  // whose own toggle already ran, target listeners firing before this ancestor one).
+  // Clicks outside the shadow retarget to the host, so a document-level listener
+  // covers the rest of the page; teardown() unhooks it.
+  root.addEventListener("click", (e) => {
+    if (!menuOpen) return;
+    const path = e.composedPath();
+    if (path.indexOf(els.menu) < 0 && path.indexOf(els.menuBtn) < 0) setMenu(false);
+  });
+  root.addEventListener("keydown", (e) => { if (menuOpen && e.key === "Escape") setMenu(false); });
+  const onDocClick = (e) => { if (menuOpen && !host.contains(e.target)) setMenu(false); };
+  document.addEventListener("click", onDocClick);
+
+  els.attach.addEventListener("click", () => els.file.click());
+  els.file.addEventListener("change", async () => {
+    const files = Array.from(els.file.files || []);
+    els.file.value = ""; // so re-picking the same file fires change again
+    for (const f of files) {
+      if (pendingImages.length >= MAX_IMAGES) break; // extras silently dropped
+      if (!f.type || f.type.indexOf("image/") !== 0) continue;
+      // Walk the export ladder until the data URL fits the per-image budget.
+      let dataUrl = null;
+      for (const [edge, q] of EXPORTS) {
+        dataUrl = await downscale(f, edge, q);
+        if (dataUrl == null || dataUrl.length <= MAX_IMG_CHARS) break;
+      }
+      if (!dataUrl) continue; // won't decode/export — skipped, as before
+      if (dataUrl.length > MAX_IMG_CHARS) {
+        addNote("That image is too large to attach.");
+        continue;
+      }
+      const total = pendingImages.reduce((n, s) => n + s.length, 0);
+      if (total + dataUrl.length > MAX_TOTAL_CHARS) {
+        addNote("Attachment limit reached for one message.");
+        break; // the combined budget for this turn is spent
+      }
+      if (pendingImages.length < MAX_IMAGES) pendingImages.push(dataUrl);
+    }
+    renderStrip();
+  });
+
   els.form.addEventListener("submit", (e) => {
     e.preventDefault();
     const text = els.input.value.trim();
-    if (!text) return;
+    // Text may be empty when images are attached — the server accepts image-only turns.
+    if (!text && !pendingImages.length) return;
+    const images = pendingImages.slice();
+    pendingImages.length = 0;
+    renderStrip();
     els.input.value = "";
-    send(text);
+    send(text, images);
   });
 
   // Pull the tenant's saved appearance (customized in the console's Install page).

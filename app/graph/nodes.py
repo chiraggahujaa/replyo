@@ -22,10 +22,9 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
-from typing import Optional
 from zoneinfo import ZoneInfo
 
-from langchain_core.messages import AIMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.types import interrupt
 from pydantic import BaseModel, Field
@@ -62,22 +61,22 @@ REPLY_TAG = "customer_reply"
 
 # ---- Active persona, read from the invocation config ----
 
-def _tenant(config: Optional[RunnableConfig]) -> dict:
+def _tenant(config: RunnableConfig | None) -> dict:
     return ((config or {}).get("configurable") or {}).get("tenant") or {}
 
 
-def _system_prompt(config: Optional[RunnableConfig]) -> str:
+def _system_prompt(config: RunnableConfig | None) -> str:
     """This persona's generated instruction, or the generic fallback."""
     return _tenant(config).get("system_prompt") or PERSONA
 
 
-def _tenant_id(config: Optional[RunnableConfig]) -> str:
+def _tenant_id(config: RunnableConfig | None) -> str:
     """Whose knowledge collection to retrieve from."""
     return _tenant(config).get("id") or DEMO_TENANT_ID
 
 
 def _reply(
-    state: ConversationState, instructions: str, *, config: Optional[RunnableConfig],
+    state: ConversationState, instructions: str, *, config: RunnableConfig | None,
     temperature: float = 0.4,
 ) -> AIMessage:
     """Shared helper: prepend the persona's system prompt and ask for one reply.
@@ -87,7 +86,56 @@ def _reply(
     """
     model = get_chat_model(temperature=temperature).with_config(tags=[REPLY_TAG])
     system = SystemMessage(content=f"{_system_prompt(config)}\n\n{instructions}")
-    return model.invoke([system, *state["messages"]])  # type: ignore[return-value]
+    return model.invoke([system, *_history_for_model(state["messages"])])  # type: ignore[return-value]
+
+
+def _text_of(content) -> str:
+    """A message's content as plain text, whether it's a string or content blocks.
+
+    Image turns arrive as [{"type": "text", ...}, {"type": "image_url", ...}] (see
+    run_turn). Anywhere a node embeds content in a PROMPT STRING or a plain-text
+    transcript, an image block must collapse to a short marker — never a megabyte
+    of base64. Message objects handed whole to the model are NOT flattened; the
+    model reads the blocks natively.
+    """
+    if isinstance(content, str):
+        return content
+    parts = []
+    for block in content:
+        if isinstance(block, str):
+            parts.append(block)
+        elif isinstance(block, dict) and block.get("type") == "text":
+            parts.append(block.get("text") or "")
+        elif isinstance(block, dict) and block.get("type") == "image_url":
+            parts.append("[image attached]")
+    return "\n".join(p for p in parts if p)
+
+
+def _history_for_model(messages: list) -> list:
+    """The history a model call may ship to the provider: images ride the LATEST turn only.
+
+    The checkpointer keeps every multimodal turn verbatim, and every node call sends
+    the whole history — so unflattened, each past image is RE-uploaded on every later
+    turn, and a thread's vision cost grows O(N^2) (an unauthenticated caller can run
+    that bill up deliberately). Earlier block-list messages therefore collapse to
+    their _text_of() text; the model already read those pixels on the turn they
+    arrived. The latest message keeps its content untouched so the current turn's
+    images reach the model. Cost then grows with images-per-turn, not thread length.
+    State's message objects are never mutated: flattened turns are fresh same-role
+    copies, everything else passes through by reference — what the checkpointer
+    stores is unchanged, only what leaves for the provider.
+    """
+    if not messages:
+        return []
+    out: list = []
+    for m in messages[:-1]:
+        if isinstance(getattr(m, "content", None), list) and m.type in ("human", "ai"):
+            cls = HumanMessage if m.type == "human" else AIMessage
+            out.append(cls(content=_text_of(m.content)))
+        else:
+            out.append(m)
+    out.append(messages[-1])
+    return out
 
 
 # ---- Triage ----
@@ -118,7 +166,7 @@ def triage(state: ConversationState) -> dict:
             "Read the conversation and classify the latest user message."
         )
     )
-    result: TriageResult = model.invoke([system, *state["messages"]])  # type: ignore[assignment]
+    result: TriageResult = model.invoke([system, *_history_for_model(state["messages"])])  # type: ignore[assignment]
     return {"intent": result.intent}
 
 
@@ -151,7 +199,7 @@ def _extract_and_merge(
             "Only fill a field if the user actually provided it; otherwise leave it null."
         )
     )
-    extracted: BaseModel = extractor.invoke([system, *state["messages"]])  # type: ignore[assignment]
+    extracted: BaseModel = extractor.invoke([system, *_history_for_model(state["messages"])])  # type: ignore[assignment]
 
     merged = dict(prior)
     for slot in all_slots:
@@ -165,7 +213,7 @@ def _extract_and_merge(
 def _slot_fill_reply(
     state: ConversationState,
     *,
-    config: Optional[RunnableConfig],
+    config: RunnableConfig | None,
     info: dict,
     all_slots: tuple[str, ...],
     required: tuple[str, ...],
@@ -197,17 +245,17 @@ ALL_LEAD_SLOTS = ("name", "need", "timeline", "budget", "contact")
 class LeadExtraction(BaseModel):
     """What the model pulls from the conversation so far. None = not yet stated."""
 
-    name: Optional[str] = Field(None, description="The prospect's name, if stated.")
-    need: Optional[str] = Field(
+    name: str | None = Field(None, description="The prospect's name, if stated.")
+    need: str | None = Field(
         None, description="The concern or service they want (e.g. cleaning, a quote, support)."
     )
-    timeline: Optional[str] = Field(
+    timeline: str | None = Field(
         None, description="How soon they want it (e.g. this week, next month, ASAP)."
     )
-    budget: Optional[str] = Field(
+    budget: str | None = Field(
         None, description="Any budget figure or insurance/plan they mention."
     )
-    contact: Optional[str] = Field(
+    contact: str | None = Field(
         None, description="A phone number or email to follow up on."
     )
 
@@ -262,17 +310,17 @@ ALL_BOOKING_SLOTS = ("name", "preferred_time", "contact")
 class BookingExtraction(BaseModel):
     """Appointment-request details pulled from the conversation. None = not stated."""
 
-    name: Optional[str] = Field(None, description="The customer's name for the appointment.")
-    preferred_time: Optional[str] = Field(
+    name: str | None = Field(None, description="The customer's name for the appointment.")
+    preferred_time: str | None = Field(
         None, description="Requested day and/or time, e.g. 'Saturday 3pm', 'next Tuesday morning'."
     )
-    contact: Optional[str] = Field(
+    contact: str | None = Field(
         None, description="A phone number or email to confirm the appointment on."
     )
 
 
 def _apply_confirmation(
-    state: ConversationState, booking: dict, result: dict, config: Optional[RunnableConfig]
+    state: ConversationState, booking: dict, result: dict, config: RunnableConfig | None
 ) -> AIMessage:
     """Record a confirmed slot on `booking` and craft the reply.
 
@@ -312,7 +360,7 @@ def _apply_confirmation(
 
 
 def _offer_alternatives(
-    state: ConversationState, booking: dict, result: dict, config: Optional[RunnableConfig]
+    state: ConversationState, booking: dict, result: dict, config: RunnableConfig | None
 ) -> AIMessage:
     """Record the offered alternatives on a conflict and ask the customer to pick one."""
     alts = [format_slot(s) for s in result["alternatives"]]
@@ -332,7 +380,7 @@ def _offer_alternatives(
 
 
 def _confirmed_ack_reply(
-    state: ConversationState, booking: dict, config: Optional[RunnableConfig]
+    state: ConversationState, booking: dict, config: RunnableConfig | None
 ) -> AIMessage:
     """Reply when a customer with a confirmed booking writes but proposes no new time."""
     return _reply(
@@ -348,7 +396,7 @@ def _confirmed_ack_reply(
 
 def _reschedule_target(
     state: ConversationState, booking: dict, *, now: datetime, tz: ZoneInfo
-) -> Optional[datetime]:
+) -> datetime | None:
     """If the latest message asks to move the booking to a concrete new time, return it.
 
     Returns None when the message proposes no specific new time (or restates the current
@@ -496,7 +544,7 @@ def handle_complaint(state: ConversationState, config: RunnableConfig) -> dict:
             "the two replies described by the schema. Be genuinely empathetic; never blame the customer."
         )
     )
-    replies: ComplaintReplies = model.invoke([system, *state["messages"]])  # type: ignore[assignment]
+    replies: ComplaintReplies = model.invoke([system, *_history_for_model(state["messages"])])  # type: ignore[assignment]
     return {
         "holding_message": replies.acknowledgement,
         "review_draft": replies.suggested_reply,
@@ -515,8 +563,10 @@ def human_review(state: ConversationState) -> dict:
       reject  -> send a safe fallback (or the human's replacement text)
     Only after resume do we append the final message to `messages`.
     """
+    # _text_of: the review queue stores and renders plain-text transcripts, so a
+    # multimodal turn shows its text plus an "[image attached]" marker.
     conversation = [
-        {"role": m.type, "content": m.content}
+        {"role": m.type, "content": _text_of(m.content)}
         for m in state["messages"]
         if getattr(m, "type", None) in ("human", "ai")
     ]
@@ -578,8 +628,19 @@ REFUSAL = (
 def _latest_user_text(state: ConversationState) -> str:
     for msg in reversed(state["messages"]):
         if getattr(msg, "type", None) == "human":
-            return msg.content
+            return _text_of(msg.content)
     return ""
+
+
+def _latest_turn_has_images(state: ConversationState) -> bool:
+    """Whether the current turn carries image blocks (see run_turn's content shape)."""
+    for msg in reversed(state["messages"]):
+        if getattr(msg, "type", None) == "human":
+            c = msg.content
+            return isinstance(c, list) and any(
+                isinstance(b, dict) and b.get("type") == "image_url" for b in c
+            )
+    return False
 
 
 def answer_from_docs(state: ConversationState, config: RunnableConfig) -> dict:
@@ -592,11 +653,16 @@ def answer_from_docs(state: ConversationState, config: RunnableConfig) -> dict:
          context and to say it doesn't know rather than invent prices/policies.
     """
     query = _latest_user_text(state)
+    # An image turn must reach the model even when retrieval comes back empty: the
+    # answer may be IN the picture (a photo, a document, a product), which the
+    # embedding of its "[image attached]" text marker can never match. The hard
+    # refusal below therefore gates text-only turns exclusively.
+    with_images = _latest_turn_has_images(state)
     hits = retrieve(query, tenant_id=_tenant_id(config), k=RETRIEVAL_K)
     relevant = [(doc, dist) for doc, dist in hits if dist <= MAX_DISTANCE]
 
     # Guard 1: nothing relevant -> refuse, don't hallucinate.
-    if not relevant:
+    if not relevant and not with_images:
         return {"messages": [AIMessage(content=REFUSAL)], "citations": []}
 
     # Build a numbered context block and the ordered, de-duped source list.
@@ -609,15 +675,30 @@ def answer_from_docs(state: ConversationState, config: RunnableConfig) -> dict:
         context_parts.append(f"[{i}] (source: {src})\n{doc.page_content}")
     context = "\n\n".join(context_parts)
 
-    # Guard 2: grounding instructions.
-    instructions = (
-        "Answer the customer's question USING ONLY the context below. If the answer is not "
-        "clearly in the context, say you don't have that information on hand and offer to "
-        "have the team follow up — do NOT guess or invent prices, policies, or availability. "
-        "Do not mention the context, sources, or citation numbers in your reply. "
-        "Keep it concise.\n\n"
-        f"Context:\n{context}"
-    )
+    # Guard 2: grounding instructions. An image turn loosens the context-only rule
+    # for what the picture shows (the model must actually look at it) but keeps it
+    # for business facts — prices/policies still can't be invented off a photo.
+    if with_images:
+        instructions = (
+            "The customer attached image(s) to this message — look at them and address "
+            "what they show directly. For business facts (prices, services, policies, "
+            "availability) use ONLY the context below; if the context doesn't cover what "
+            "they need, say so and offer to have the team follow up — do NOT invent "
+            "specifics. If asked to identify or make judgements about a person in a "
+            "photo, explain you can't do that and help with what you can. "
+            "Do not mention the context, sources, or citation numbers in your reply. "
+            "Keep it concise."
+            + (f"\n\nContext:\n{context}" if context else "")
+        )
+    else:
+        instructions = (
+            "Answer the customer's question USING ONLY the context below. If the answer is not "
+            "clearly in the context, say you don't have that information on hand and offer to "
+            "have the team follow up — do NOT guess or invent prices, policies, or availability. "
+            "Do not mention the context, sources, or citation numbers in your reply. "
+            "Keep it concise.\n\n"
+            f"Context:\n{context}"
+        )
     ai = _reply(state, instructions, config=config, temperature=0.1)
 
     # Sources are tracked as citations metadata but no longer shown in the reply text.

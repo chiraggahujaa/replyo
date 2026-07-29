@@ -16,8 +16,8 @@ see `supabase/migrations/*_create_follow_ups.sql`.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from app.config import settings
 from app.tenancy import admin_connection, scoped_connection
@@ -27,7 +27,7 @@ logger = logging.getLogger("replyo.followups")
 
 # ---- Decision: does this conversation deserve a nudge? ----
 
-def follow_up_reason(result: dict) -> Optional[str]:
+def follow_up_reason(result: dict) -> str | None:
     """Why we should re-engage this conversation later, or None to cancel any nudge.
 
     Deliberately conservative — we'd rather miss a nudge than pester someone:
@@ -66,8 +66,8 @@ def follow_up_reason(result: dict) -> Optional[str]:
 
 
 async def schedule(
-    *, tenant_id: str, thread_id: str, channel: str, chat_id: Optional[str], reason: str,
-    delay_hours: Optional[float] = None,
+    *, tenant_id: str, thread_id: str, channel: str, chat_id: str | None, reason: str,
+    delay_hours: float | None = None,
 ) -> None:
     """Upsert a pending nudge for this thread, due `delay_hours` from now.
 
@@ -76,7 +76,7 @@ async def schedule(
     by the ON CONFLICT guard, so a cold lead is never nagged twice.
     """
     delay = settings.followup_delay_hours if delay_hours is None else delay_hours
-    due_at = datetime.now(timezone.utc) + timedelta(hours=delay)
+    due_at = datetime.now(UTC) + timedelta(hours=delay)
     async with await scoped_connection(tenant_id=tenant_id) as conn:
         await conn.execute(
             """insert into follow_ups (tenant_id, thread_id, channel, chat_id, reason, due_at, status)
@@ -104,8 +104,8 @@ async def cancel(*, tenant_id: str, thread_id: str) -> None:
 
 
 async def record_turn(
-    *, tenant_id: str, thread_id: str, channel: str, chat_id: Optional[str], result: dict
-) -> Optional[str]:
+    *, tenant_id: str, thread_id: str, channel: str, chat_id: str | None, result: dict
+) -> str | None:
     """Schedule or cancel this thread's nudge based on how the turn ended.
 
     Never raises: a follow-up is a side effect, so a database hiccup here must not

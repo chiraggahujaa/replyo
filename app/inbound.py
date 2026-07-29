@@ -12,7 +12,6 @@ queues or follow-up scheduling.
 from __future__ import annotations
 
 import logging
-from typing import Optional
 
 from app import followups, reviews
 from app.graph.build import run_turn
@@ -35,18 +34,21 @@ def scoped_thread(tenant_id: str, thread_id: str) -> str:
 
 
 async def handle_inbound(
-    graph, *, tenant: dict, thread_id: str, channel: str, chat_id: Optional[str],
-    text: str, on_token=None,
+    graph, *, tenant: dict, thread_id: str, channel: str, chat_id: str | None,
+    text: str, on_token=None, images: list[str] | None = None,
 ) -> dict:
     """Run one turn for `text` under `tenant`, then apply the post-turn side effects.
 
     `tenant` is the full persona row: the graph uses its prompt + knowledge collection,
     and the side effects are written under its id. Returns `run_turn`'s result dict plus
     `review_id` (set when the reply was held for approval). `on_token` streams the reply
-    (websocket channel); the others don't.
+    (websocket channel); the others don't. `images` are data-URL attachments riding the
+    same turn (the web widget's HTTP path today) — validated upstream, opaque here.
     """
     tenant_id = str(tenant["id"])
-    result = await run_turn(graph, thread_id, text, channel=channel, tenant=tenant, on_token=on_token)
+    result = await run_turn(
+        graph, thread_id, text, channel=channel, tenant=tenant, on_token=on_token, images=images
+    )
 
     review_id = None
     if result.get("held"):

@@ -42,3 +42,57 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["app"]
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.0",
+    "pyright==1.1.411",
+    "ruff==0.16.0",
+]
+
+# ---------------------------------------------------------------------------
+# Lint & type-check configuration (ruff + pyright). Run locally with:
+#   uv run ruff check .    # lint
+#   uv run pyright         # types (same engine as VS Code's Pylance)
+# Both are pinned dev dependencies, so local, pre-commit and CI
+# (.github/workflows/ci.yml) always run identical versions.
+# ---------------------------------------------------------------------------
+
+[tool.ruff]
+line-length = 120           # matches the repo's readable single-line-import style
+target-version = "py311"    # keep in step with requires-python
+
+[tool.ruff.lint]
+# E4/E7/E9 + F are ruff's core correctness rules; W catches stray whitespace,
+# B (bugbear) catches likely bugs, UP keeps typing syntax modern, I sorts imports.
+select = ["E4", "E7", "E9", "F", "W", "B", "UP", "I"]
+ignore = [
+    "B008",  # FastAPI's `Depends(...)` in argument defaults is the framework idiom
+]
+
+
+[tool.pyright]
+# scripts/ are manual integration/ops scripts (need a live DB + API keys) — ruff
+# still lints them, but they aren't part of the type-checked surface.
+include = ["app"]
+exclude = ["**/__pycache__", ".venv"]
+venvPath = "."
+venv = ".venv"
+# Check against the SUPPORTED floor (requires-python), not the local interpreter —
+# otherwise 3.12+-only stdlib usage would pass every check while breaking 3.11.
+pythonVersion = "3.11"
+typeCheckingMode = "standard"
+
+# The graph layer passes loosely-typed dicts through LangGraph state on purpose
+# (typing it strictly is a refactor, not a lint fix), and python-telegram-bot's
+# Update fields are all Optional even when guaranteed by the handler filters.
+# Downgrade just those diagnostics there; everything else stays at error.
+[[tool.pyright.executionEnvironments]]
+root = "app/graph"
+reportArgumentType = "warning"
+reportReturnType = "warning"
+reportTypedDictNotRequiredAccess = "warning"
+
+[[tool.pyright.executionEnvironments]]
+root = "app/channels"
+reportOptionalMemberAccess = "warning"

@@ -10,15 +10,16 @@ A persona learns from two source kinds, both landing in the same pgvector collec
 
 Ingestion is slow (a crawl hits many pages and embeds them), so callers run it as a
 background task and watch the `knowledge_sources.status`/`page_count` columns for
-progress. Everything writes under the tenant's scoped connection, so RLS keeps a
-persona's knowledge rows its own.
+progress — each status UPDATE also fires the admin_change_notify trigger, which is
+what makes the dashboard's counter tick live over its websocket. Everything writes
+under the tenant's scoped connection, so RLS keeps a persona's knowledge rows its own.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from urllib.parse import urldefrag, urljoin, urlparse
 from urllib.robotparser import RobotFileParser
 
@@ -46,6 +47,16 @@ USER_AGENT = "ReplyoBot/1.0 (+https://replyo.app/bot)"
 
 _splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
 
+# add_documents runs in a worker thread (so it can't freeze the event loop), which
+# means two ingests for the same tenant could otherwise race PGVector's lazy
+# collection creation. One lock per tenant restores the serialization the old
+# blocking call provided by accident, without re-blocking the loop.
+_embed_locks: dict[str, asyncio.Lock] = {}
+
+
+def _embed_lock(tenant_id: str) -> asyncio.Lock:
+    return _embed_locks.setdefault(tenant_id, asyncio.Lock())
+
 
 # ---------------------------------------------------------------------------
 # status tracking
@@ -60,7 +71,10 @@ async def _set_status(tenant_id: str, source_id: str, status: str, **fields) -> 
     params += [source_id]
     async with await scoped_connection(tenant_id=tenant_id) as conn:
         await conn.execute(
-            f"update knowledge_sources set {', '.join(sets)} where id = %s", tuple(params)
+            # Column names are code-controlled kwargs, never user input — the dynamic
+            # SQL is trusted (pyright can't see that, hence the ignore).
+            f"update knowledge_sources set {', '.join(sets)} where id = %s",  # pyright: ignore[reportArgumentType]
+            tuple(params),
         )
 
 
@@ -99,8 +113,17 @@ async def _load_robots(client: httpx.AsyncClient, start_url: str) -> RobotFilePa
     return rp
 
 
-async def crawl(start_url: str, *, extra_urls: tuple[str, ...] = (), max_pages: int = MAX_PAGES):
-    """Breadth-first, same-domain crawl. Returns [(url, title, text)] for pages with text."""
+async def crawl(
+    start_url: str,
+    *,
+    extra_urls: tuple[str, ...] = (),
+    max_pages: int = MAX_PAGES,
+    on_page=None,
+):
+    """Breadth-first, same-domain crawl. Returns [(url, title, text)] for pages with text.
+
+    `on_page` (async, optional) is awaited with the running page count after each kept
+    page, so callers can surface progress while the crawl is still running."""
     seen: set[str] = set()
     # User-supplied important URLs first, then the entry point.
     queue: list[str] = [*extra_urls, start_url]
@@ -130,10 +153,13 @@ async def crawl(start_url: str, *, extra_urls: tuple[str, ...] = (), max_pages: 
             title = (soup.title.string.strip() if soup.title and soup.title.string else url)
             if text.strip():
                 pages.append((url, title, text))
+                if on_page is not None:
+                    await on_page(len(pages))
 
             # Enqueue same-site links we haven't seen.
             for a in soup.find_all("a", href=True):
-                link = _normalize(urljoin(url, a["href"]))
+                # href is always a plain string (only class/rel are multi-valued in bs4).
+                link = _normalize(urljoin(url, a["href"]))  # pyright: ignore[reportArgumentType]
                 if link not in seen and _same_site(link, start_url) and link.startswith("http"):
                     queue.append(link)
 
@@ -154,11 +180,14 @@ async def ingest_upload(*, tenant_id: str, source_id: str, name: str, text: str)
             Document(page_content=chunk, metadata={"source": name})
             for chunk in _splitter.split_text(text)
         ]
-        build_store(tenant_id).add_documents(docs)
+        # add_documents is synchronous (embedding HTTP + SQLAlchemy) — run it off the
+        # event loop so the chat/admin websockets this process serves don't freeze.
+        async with _embed_lock(tenant_id):
+            await asyncio.to_thread(lambda: build_store(tenant_id).add_documents(docs))
         await _set_status(
             tenant_id, source_id, "ready",
             chunk_count=len(docs), page_count=1,
-            last_ingested_at=datetime.now(timezone.utc),
+            last_ingested_at=datetime.now(UTC),
         )
         logger.info("Ingested upload %s (%d chunks) for tenant %s", name, len(docs), tenant_id)
     except Exception as exc:
@@ -172,19 +201,33 @@ async def ingest_website(
     """Deep-crawl a site and embed each page as its own citable source."""
     try:
         await _set_status(tenant_id, source_id, "ingesting")
-        pages = await crawl(url, extra_urls=extra_urls)
-        docs: list[Document] = []
-        for page_url, title, text in pages:
-            for chunk in _splitter.split_text(text):
-                docs.append(Document(page_content=chunk, metadata={"source": title, "url": page_url}))
-            # cheap progress signal for the dashboard's live counter
-            await _set_status(tenant_id, source_id, "ingesting", page_count=len(pages))
+
+        async def report(count: int) -> None:
+            # Written per crawled page, WHILE the crawl runs — each UPDATE fires the
+            # admin_change_notify trigger, which is what makes the dashboard's crawl
+            # counter tick live over its websocket. Cosmetic only: a transient DB
+            # blip here must not abort a crawl that's fetching pages just fine.
+            try:
+                await _set_status(tenant_id, source_id, "ingesting", page_count=count)
+            except Exception:
+                logger.warning(
+                    "Progress write failed for source %s (continuing)", source_id, exc_info=True
+                )
+
+        pages = await crawl(url, extra_urls=extra_urls, on_page=report)
+        docs = [
+            Document(page_content=chunk, metadata={"source": title, "url": page_url})
+            for page_url, title, text in pages
+            for chunk in _splitter.split_text(text)
+        ]
         if docs:
-            build_store(tenant_id).add_documents(docs)
+            # Synchronous embedding + inserts — off the loop, same reason as uploads.
+            async with _embed_lock(tenant_id):
+                await asyncio.to_thread(lambda: build_store(tenant_id).add_documents(docs))
         await _set_status(
             tenant_id, source_id, "ready",
             page_count=len(pages), chunk_count=len(docs),
-            last_ingested_at=datetime.now(timezone.utc),
+            last_ingested_at=datetime.now(UTC),
         )
         logger.info(
             "Crawled %s: %d pages -> %d chunks for tenant %s", url, len(pages), len(docs), tenant_id

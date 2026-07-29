@@ -1,7 +1,8 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { DecisionAction, Review, decideReview, listReviews } from "@/lib/api";
+import { useLiveResource, useRefetch } from "@/lib/live";
 import { Shell } from "../components/Shell";
 import { useReplyo } from "../providers";
 import { ReviewList } from "../components/ReviewList";
@@ -9,6 +10,7 @@ import { ReviewDetail } from "../components/ReviewDetail";
 import { Badge, Button, EmptyState, SkeletonCard, ToastShelf, type ToastItem } from "../components/ui";
 import { InboxIcon, PlusIcon, RocketIcon } from "../components/icons";
 
+// Fallback cadence when the websocket is down; while it's up, changes push instantly.
 const POLL_MS = 4000;
 
 export default function QueuePage() {
@@ -33,7 +35,6 @@ function Queue({ active }: { active: NonNullable<ReturnType<typeof useReplyo>["a
   const [reviews, setReviews] = useState<Review[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const [connected, setConnected] = useState(true);
   const [toasts, setToasts] = useState<ToastItem[]>([]);
   const toastSeq = useRef(0);
 
@@ -43,28 +44,18 @@ function Queue({ active }: { active: NonNullable<ReturnType<typeof useReplyo>["a
     setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 3800);
   }, []);
 
-  useEffect(() => {
-    let cancelled = false;
-    async function tick() {
-      try {
-        const data = await listReviews(tenantId);
-        if (cancelled) return;
-        setConnected(true);
-        setReviews(data);
-        setSelectedId((cur) => (cur && data.some((r) => r.id === cur) ? cur : data[0]?.id ?? null));
-      } catch {
-        if (!cancelled) setConnected(false);
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
+  // Socket-pushed updates with polling fallback. Errors must propagate (they drive
+  // `connected`), so the finally clears the skeleton without swallowing them.
+  const refetch = useRefetch(async () => {
+    try {
+      const data = await listReviews(tenantId);
+      setReviews(data);
+      setSelectedId((cur) => (cur && data.some((r) => r.id === cur) ? cur : data[0]?.id ?? null));
+    } finally {
+      setLoading(false);
     }
-    tick();
-    const t = setInterval(tick, POLL_MS);
-    return () => {
-      cancelled = true;
-      clearInterval(t);
-    };
-  }, [tenantId]);
+  });
+  const { live, connected } = useLiveResource({ tenantId, topic: "reviews", refetch, pollMs: POLL_MS });
 
   const handleResolved = useCallback(
     (id: string, action: DecisionAction) => {
@@ -91,8 +82,11 @@ function Queue({ active }: { active: NonNullable<ReturnType<typeof useReplyo>["a
           <div className="text-[12.5px] text-[var(--color-muted)]">{active.name}</div>
         </div>
         <div className="flex items-center gap-2.5">
-          <Badge tone={connected ? "success" : "danger"} pulse={connected}>
-            {connected ? "Live" : "Offline"}
+          {/* Live = socket push and fetches succeeding; Polling = HTTP fallback (still
+              fresh, just slower); Offline = the data on screen may be stale. `connected`
+              wins over `live`: a green badge must never sit above data we can't fetch. */}
+          <Badge tone={connected ? (live ? "success" : "warning") : "danger"} pulse={connected}>
+            {connected ? (live ? "Live" : "Polling") : "Offline"}
           </Badge>
           <Badge tone="accent" className="tabular-nums">
             {reviews.length} pending

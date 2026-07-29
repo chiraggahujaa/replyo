@@ -16,8 +16,9 @@ service-account*.json
 *-service-account.json
 credentials*.json
 
-# uv
-uv.lock
+# uv — the lockfile IS committed (CI installs with `uv sync --frozen`); only
+# local uv state is ignored.
+.uv-cache/
 
 # OS / editor
 .DS_Store

@@ -54,8 +54,11 @@ export function ReviewDetail({
     if (busy) return;
     setBusy(action);
     try {
-      // "approve" sends the draft as-is; "edit" sends the edited text.
-      const text = action === "approve" ? undefined : draft;
+      // "approve" sends the draft as-is; "edit" sends the edited text. "reject" only
+      // sends the textarea if the reviewer actually rewrote it — an untouched draft
+      // is the thing being rejected, so sending it would defeat the whole rejection;
+      // with no text the backend substitutes its safe handoff message.
+      const text = action === "approve" || (action === "reject" && !edited) ? undefined : draft;
       const res = await decide(review.id, action, text);
       onResolved(review.id, action, res.final_reply);
     } catch (e) {
@@ -131,7 +134,7 @@ export function ReviewDetail({
             Reject
           </Button>
           <span className="ml-auto text-[12.5px] text-[var(--color-faint)]">
-            Reject sends a safe handoff message · edits override the draft
+            Reject sends a safe handoff (or your rewrite) · edits override the draft
           </span>
         </div>
       </div>

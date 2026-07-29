@@ -25,12 +25,12 @@ import logging
 import secrets
 import uuid
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 import jwt
 import psycopg
 from fastapi import Header, HTTPException
-from psycopg.rows import dict_row
+from psycopg.rows import DictRow, dict_row
 
 from app.config import settings
 
@@ -47,15 +47,17 @@ DEMO_TENANT_ID = "00000000-0000-0000-0000-000000000001"
 # ---------------------------------------------------------------------------
 
 async def scoped_connection(
-    *, user_id: Optional[str] = None, tenant_id: Optional[str] = None
-) -> psycopg.AsyncConnection:
+    *, user_id: str | None = None, tenant_id: str | None = None
+) -> psycopg.AsyncConnection[DictRow]:
     """Open an autocommit connection that runs under RLS as `authenticated`.
 
     The GUCs are set with `set_config(..., is_local => false)`, i.e. for the session;
     since these connections are short-lived (opened per operation, closed after) the
     role and GUCs are discarded on close, so nothing leaks between callers.
     """
-    conn = await psycopg.AsyncConnection.connect(
+    # Parameterizing the class (AsyncConnection[DictRow]) is what tells the type
+    # checker rows are dicts — connect() alone is typed TupleRow in psycopg's stubs.
+    conn = await psycopg.AsyncConnection[DictRow].connect(
         settings.database_url, autocommit=True, row_factory=dict_row
     )
     await conn.execute("set role authenticated")
@@ -66,9 +68,9 @@ async def scoped_connection(
     return conn
 
 
-async def admin_connection() -> psycopg.AsyncConnection:
+async def admin_connection() -> psycopg.AsyncConnection[DictRow]:
     """Open a connection as `postgres` (BYPASSES RLS). Cross-tenant infra only."""
-    return await psycopg.AsyncConnection.connect(
+    return await psycopg.AsyncConnection[DictRow].connect(
         settings.database_url, autocommit=True, row_factory=dict_row
     )
 
@@ -80,13 +82,13 @@ async def admin_connection() -> psycopg.AsyncConnection:
 @dataclass(frozen=True)
 class User:
     id: str
-    email: Optional[str]
+    email: str | None
 
 
-_jwk_client: Optional["jwt.PyJWKClient"] = None
+_jwk_client: jwt.PyJWKClient | None = None
 
 
-def _jwks() -> "jwt.PyJWKClient":
+def _jwks() -> jwt.PyJWKClient:
     global _jwk_client
     if _jwk_client is None:
         if not settings.supabase_url:
@@ -183,10 +185,12 @@ async def create_tenant(user: User, *, name: str, timezone: str = "UTC") -> dict
                 (tenant_id, user.id),
             )
         # Now visible via the fresh membership.
-        return await (await conn.execute("select * from tenants where id = %s", (tenant_id,))).fetchone()
+        row = await (await conn.execute("select * from tenants where id = %s", (tenant_id,))).fetchone()
+        assert row is not None  # both inserts committed above, so the row must be visible
+        return row
 
 
-async def tenant_by_public_key(public_key: str) -> Optional[dict[str, Any]]:
+async def tenant_by_public_key(public_key: str) -> dict[str, Any] | None:
     """Resolve the widget's public key to a tenant. Read via admin (no user context);
     the public key is the credential, and the row is safe to return as-is."""
     async with await admin_connection() as conn:
@@ -195,7 +199,7 @@ async def tenant_by_public_key(public_key: str) -> Optional[dict[str, Any]]:
         )).fetchone()
 
 
-async def get_tenant(tenant_id: str) -> Optional[dict[str, Any]]:
+async def get_tenant(tenant_id: str) -> dict[str, Any] | None:
     """Fetch a tenant row by id (admin). For trusted infra that already knows the id —
     the single-tenant channels and the follow-up worker resolving a row's tenant."""
     async with await admin_connection() as conn:

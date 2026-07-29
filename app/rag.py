@@ -16,6 +16,7 @@ from functools import lru_cache
 from langchain_core.documents import Document
 from langchain_openai import OpenAIEmbeddings
 from langchain_postgres import PGVector
+from pydantic import SecretStr
 
 from app.config import settings
 
@@ -53,7 +54,7 @@ def _sqlalchemy_url() -> str:
 
 
 def get_embeddings() -> OpenAIEmbeddings:
-    return OpenAIEmbeddings(model=EMBEDDING_MODEL, api_key=settings.openai_api_key)
+    return OpenAIEmbeddings(model=EMBEDDING_MODEL, api_key=SecretStr(settings.openai_api_key))
 
 
 def build_store(tenant_id: str, pre_delete: bool = False) -> PGVector:

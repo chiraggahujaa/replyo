@@ -126,6 +126,11 @@ async def receive(request: Request) -> dict:
 
     graph = request.app.state.graph
     tenant = await get_tenant(DEMO_TENANT_ID)  # single-tenant in phase 1
+    if tenant is None:
+        # The demo persona is seed data — its absence means a broken install, not a
+        # bad message. Log loudly but still 200 so Meta doesn't redeliver forever.
+        logger.error("Demo tenant missing — dropping %d WhatsApp message(s).", len(messages))
+        return {"status": "error", "detail": "demo tenant missing"}
     handled = 0
     for msg in messages:
         if _seen.seen(msg.message_id):

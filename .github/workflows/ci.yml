@@ -1,0 +1,107 @@
+# CI — mirrors the local checks exactly (ruff/pyright config in pyproject.toml,
+# eslint/tsc per Next.js app), so a passing pre-commit + local build means green here.
+#
+# No job needs secrets: the backend "import smoke" uses dummy env values (Settings
+# only requires the vars to exist at import time), and the Next.js builds get dummy
+# NEXT_PUBLIC_* values (the Supabase client is constructed at build time but never
+# contacted).
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend — ruff, pyright, import smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+          enable-cache: true
+
+      - name: Install (locked)
+        run: uv sync --frozen
+
+      - name: Ruff
+        run: uv run ruff check .
+
+      - name: Pyright
+        # Same engine as VS Code's Pylance; config lives in [tool.pyright].
+        # Version comes from the pinned dev dependency, so CI can't drift.
+        run: uv run pyright
+
+      - name: Import smoke
+        # Catches import-time breakage lint can't see (bad module-level code,
+        # missing deps). Dummy values only need to exist — nothing connects.
+        env:
+          OPENAI_API_KEY: ci-dummy
+          DATABASE_URL: postgresql://ci:ci@localhost:5432/ci
+        run: uv run python -c "import app.api, app.channels.telegram_bot, scripts.migrate"
+
+  dashboard:
+    name: Dashboard — eslint, tsc, build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dashboard
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+
+      - name: Install (locked)
+        run: npm ci
+
+      - name: ESLint
+        run: npm run lint
+
+      - name: TypeScript
+        run: npx tsc --noEmit
+
+      - name: Build
+        env:
+          NEXT_PUBLIC_API_URL: http://localhost:8000
+          NEXT_PUBLIC_SUPABASE_URL: https://ci-dummy.supabase.co
+          NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: sb_publishable_ci_dummy
+        run: npm run build
+
+  clinic-site:
+    name: Clinic site — eslint, tsc, build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: clinic-site
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: clinic-site/package-lock.json
+
+      - name: Install (locked)
+        run: npm ci
+
+      - name: ESLint
+        run: npm run lint
+
+      - name: TypeScript
+        run: npx tsc --noEmit
+
+      - name: Build
+        run: npm run build

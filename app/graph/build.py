@@ -154,7 +154,8 @@ def _shape_result(values: dict, interrupts) -> dict:
 
 
 async def run_turn(
-    graph, thread_id: str, text: str, *, channel: str = "api", tenant: dict | None = None, on_token=None
+    graph, thread_id: str, text: str, *, channel: str = "api", tenant: dict | None = None,
+    on_token=None, images: list[str] | None = None,
 ) -> dict:
     """Run one conversation turn and return {"intent", "reply", ...}.
 
@@ -165,9 +166,20 @@ async def run_turn(
     and the offline tests work unchanged (they run under the fallback persona).
 
     Pass `on_token` (an async callable) to stream the reply as it's generated.
+    `images` (data-URL strings, validated by the caller) attach to this turn.
     """
     config = _trace_config(thread_id, channel=channel, run_name=f"replyo:{channel}", tenant=tenant)
-    inputs = {"messages": [HumanMessage(content=text)]}
+    # An image turn is stored as OpenAI-style content blocks — the model reads them
+    # natively, and everything that needs plain text goes through _text_of in nodes.
+    # A text-only turn stays a plain string so checkpointed threads and every existing
+    # caller are byte-for-byte unchanged.
+    if images:
+        content: str | list = [{"type": "text", "text": text}] + [
+            {"type": "image_url", "image_url": {"url": url}} for url in images
+        ]
+    else:
+        content = text
+    inputs = {"messages": [HumanMessage(content=content)]}
 
     if on_token is None:
         result = await graph.ainvoke(inputs, config=config)

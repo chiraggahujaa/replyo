@@ -4,13 +4,15 @@ All routes require a signed-in user (get_current_user). Anything about a specifi
 persona additionally goes through `_require_tenant`, which is the authorization
 chokepoint: it 404s unless the user is a member, so a member of persona A can never
 read or mutate persona B. Knowledge ingestion (upload/crawl) is slow, so it's kicked
-off as a background task and the dashboard polls the source's status.
+off as a background task; the dashboard follows the source's status live over the
+admin websocket (each status UPDATE fires the admin_change_notify trigger), polling
+only as the fallback.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Literal, Optional
+from typing import Literal
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, UploadFile
 from psycopg.types.json import Jsonb
@@ -19,7 +21,6 @@ from pydantic import BaseModel, Field
 from app.knowledge import ingest_upload, ingest_website
 from app.persona import generate_system_prompt
 from app.rag import build_store
-from app.widget_config import cache_invalidate, sanitize_widget_config
 from app.tenancy import (
     DEMO_TENANT_ID,
     User,
@@ -29,6 +30,7 @@ from app.tenancy import (
     scoped_connection,
     tenant_for_user,
 )
+from app.widget_config import cache_invalidate, sanitize_widget_config
 
 logger = logging.getLogger("replyo.admin")
 
@@ -45,17 +47,17 @@ class CreatePersona(BaseModel):
 
 
 class UpdatePersona(BaseModel):
-    name: Optional[str] = None
-    system_prompt: Optional[str] = None
-    extra_notes: Optional[str] = None
-    onboarding_status: Optional[str] = None
+    name: str | None = None
+    system_prompt: str | None = None
+    extra_notes: str | None = None
+    onboarding_status: str | None = None
     # Lifecycle: paused personas keep their console but the public widget answers with
     # an "unavailable" notice and follow-ups skip them. Literal so nothing else can be
     # written into the column (it's CHECK-constrained anyway; fail at 422, not 500).
-    status: Optional[Literal["active", "paused"]] = None
+    status: Literal["active", "paused"] | None = None
     # Widget appearance (name + styling) from the Install page. Sanitized on write;
     # `{}` is the reset (embeds fall back to defaults + the persona's name).
-    widget_config: Optional[dict] = None
+    widget_config: dict | None = None
 
 
 class AddWebsite(BaseModel):
@@ -117,7 +119,10 @@ async def update(
     params = list(fields.values()) + [str(tenant["id"])]
     async with await scoped_connection(user_id=user.id, tenant_id=str(tenant["id"])) as conn:
         row = await (await conn.execute(
-            f"update tenants set {sets} where id = %s returning *", tuple(params)
+            # Column names come from the whitelisted pydantic model, never the client —
+            # the dynamic SQL is trusted (pyright can't see that, hence the ignore).
+            f"update tenants set {sets} where id = %s returning *",  # pyright: ignore[reportArgumentType]
+            tuple(params),
         )).fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Persona not found")
@@ -201,7 +206,7 @@ async def upload(
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
-        raise HTTPException(400, "Only UTF-8 text files (.txt/.md) are supported for now.")
+        raise HTTPException(400, "Only UTF-8 text files (.txt/.md) are supported for now.") from None
     if not text.strip():
         raise HTTPException(400, "The file appears to be empty.")
 
@@ -212,6 +217,7 @@ async def upload(
             "values (%s, 'upload', %s, 'pending') returning *",
             (tid, file.filename or "document"),
         )).fetchone()
+    assert row is not None  # INSERT .. RETURNING always yields the new row
 
     background.add_task(
         ingest_upload, tenant_id=tid, source_id=str(row["id"]), name=row["name"], text=text
@@ -234,6 +240,7 @@ async def add_website(
             "values (%s, 'website', %s, %s, 'pending') returning *",
             (tid, body.url, body.url),
         )).fetchone()
+    assert row is not None  # INSERT .. RETURNING always yields the new row
 
     background.add_task(
         ingest_website,

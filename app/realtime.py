@@ -1,14 +1,21 @@
-"""Realtime fan-out to open chat widgets.
+"""Realtime fan-out to open chat widgets and dashboard consoles.
 
-Two kinds of message need to reach a browser that isn't in the middle of a request:
+Three kinds of event need to reach a browser that isn't in the middle of a request:
 
   * a reply a human just approved in the dashboard  (published by the API process)
   * a scheduled 48h re-engagement nudge             (published by the follow-up worker)
+  * a queue/knowledge change for the dashboard      (published by Postgres triggers —
+    see the admin_change_notify migration)
 
-The second one is the awkward part: it comes from a *different process* than the one
-holding the websocket. Postgres LISTEN/NOTIFY solves both without adding Redis or any
-other infrastructure — any process NOTIFYs on one channel, and every API process
-LISTENs and forwards the event to whichever sockets it happens to be holding.
+The awkward part is that events come from *different processes* than the one holding
+the websocket (the follow-up worker, the Telegram worker escalating a message, another
+uvicorn worker). Postgres LISTEN/NOTIFY solves all of it without adding Redis or any
+other infrastructure — any process (or trigger) NOTIFYs on one channel, and every API
+process LISTENs and forwards the event to whichever sockets it happens to be holding.
+
+Sockets register under an opaque routing key: chat widgets use their tenant-scoped
+thread id, dashboard consoles use `admin:<tenant_id>` (see `admin_key`). The NOTIFY
+envelope is `{"key": ..., "event": {...}}`.
 
 Verified working through Supabase's **session** pooler (port 5432). It would NOT work
 through the transaction pooler on 6543 — the same reason the README insists on the
@@ -32,10 +39,21 @@ from app.config import settings
 
 logger = logging.getLogger("replyo.realtime")
 
-CHANNEL = "replyo_events"
+CHANNEL = "replyo_events"  # the admin_change_notify migration hardcodes this name too
 # Postgres hard-limits a NOTIFY payload to 8000 bytes; stay well under it and fall
 # back to telling the client to re-sync over HTTP if an event is ever too big.
 MAX_PAYLOAD = 7000
+
+
+def admin_key(tenant_id: str) -> str:
+    """Routing key a dashboard console registers under. The admin_change_notify
+    migration builds the same 'admin:<tenant_id>' string in SQL — keep them in step.
+
+    The 'admin:' prefix is deliberately outside the namespace widget sockets can
+    claim: ws_chat registers scoped_thread() keys, which always start with a
+    resolved tenant UUID — never the literal 'admin' — so an anonymous visitor
+    can't register here and receive a tenant's queue events."""
+    return f"admin:{tenant_id}"
 
 
 class Hub:
@@ -47,34 +65,34 @@ class Hub:
 
     # ---- local socket registry ----
 
-    def register(self, thread_id: str, ws: Any) -> None:
-        self._sockets[thread_id].add(ws)
+    def register(self, key: str, ws: Any) -> None:
+        self._sockets[key].add(ws)
 
-    def unregister(self, thread_id: str, ws: Any) -> None:
-        conns = self._sockets.get(thread_id)
+    def unregister(self, key: str, ws: Any) -> None:
+        conns = self._sockets.get(key)
         if not conns:
             return
         conns.discard(ws)
         if not conns:
-            self._sockets.pop(thread_id, None)
+            self._sockets.pop(key, None)
 
-    def connection_count(self, thread_id: str) -> int:
-        return len(self._sockets.get(thread_id, ()))
+    def connection_count(self, key: str) -> int:
+        return len(self._sockets.get(key, ()))
 
-    async def deliver_local(self, thread_id: str, event: dict) -> None:
-        """Send an event to every socket this process holds for the thread."""
-        for ws in list(self._sockets.get(thread_id, ())):
+    async def deliver_local(self, key: str, event: dict) -> None:
+        """Send an event to every socket this process holds for the routing key."""
+        for ws in list(self._sockets.get(key, ())):
             try:
                 await ws.send_json(event)
             except Exception:
                 # A dead socket shouldn't stop the others; the endpoint's finally
                 # block unregisters it on disconnect anyway.
-                logger.debug("Dropping a closed socket for %s", thread_id, exc_info=True)
-                self.unregister(thread_id, ws)
+                logger.debug("Dropping a closed socket for %s", key, exc_info=True)
+                self.unregister(key, ws)
 
     # ---- cross-process publish ----
 
-    async def publish(self, thread_id: str, event: dict) -> None:
+    async def publish(self, key: str, event: dict) -> None:
         """Broadcast an event to every process (including this one).
 
         Never raises: realtime delivery is a nicety layered on top of state that is
@@ -82,10 +100,10 @@ class Hub:
         The widget re-syncs on its next connect regardless.
         """
         try:
-            payload = json.dumps({"thread_id": thread_id, "event": event})
+            payload = json.dumps({"key": key, "event": event})
             if len(payload.encode()) > MAX_PAYLOAD:
                 # Too big to ship through NOTIFY — tell the client to pull instead.
-                payload = json.dumps({"thread_id": thread_id, "event": {"type": "refresh"}})
+                payload = json.dumps({"key": key, "event": {"type": "refresh"}})
             # Publishes are rare (an approval, a nudge), so a short-lived connection
             # is simpler than keeping a dedicated publisher pool warm.
             conn = await psycopg.AsyncConnection.connect(settings.database_url, autocommit=True)
@@ -94,11 +112,12 @@ class Hub:
             finally:
                 await conn.close()
         except Exception:
-            logger.exception("Realtime publish failed for %s", thread_id)
+            logger.exception("Realtime publish failed for %s", key)
 
     # ---- listener ----
 
     async def _listen_forever(self) -> None:
+        attached_before = False
         while True:
             try:
                 conn = await psycopg.AsyncConnection.connect(
@@ -106,10 +125,20 @@ class Hub:
                 )
                 await conn.execute(f"LISTEN {CHANNEL}")
                 logger.info("Realtime listener attached (channel=%s).", CHANNEL)
+                if attached_before:
+                    # NOTIFY is fire-and-forget: anything published while we were
+                    # detached is gone. Tell every socket we hold to re-pull over
+                    # HTTP (both the widget and the dashboard handle "refresh").
+                    for key in list(self._sockets):
+                        await self.deliver_local(key, {"type": "refresh"})
+                attached_before = True
                 async for note in conn.notifies():
                     try:
                         data = json.loads(note.payload)
-                        await self.deliver_local(data["thread_id"], data["event"])
+                        # "thread_id" kept for any publisher predating the key rename.
+                        key = data.get("key") or data.get("thread_id")
+                        if key:
+                            await self.deliver_local(key, data["event"])
                     except Exception:
                         logger.exception("Bad realtime payload: %s", note.payload[:200])
             except asyncio.CancelledError:

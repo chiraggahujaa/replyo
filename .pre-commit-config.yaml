@@ -1,0 +1,47 @@
+# Pre-commit hooks — run automatically on `git commit` (install once with
+# `uv run pre-commit install`). Everything here also runs in CI with the same
+# pinned versions; CI additionally runs pyright, tsc and the Next.js builds.
+#
+# Run against the whole repo manually:  uv run pre-commit run --all-files
+
+repos:
+  # Generic hygiene: whitespace, EOF newlines, broken YAML/TOML/JSON, merge
+  # markers, accidentally-committed keys or huge files.
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+        exclude: '\.svg$'  # vendored Next.js starter assets ship without one
+      - id: check-yaml
+      - id: check-toml
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ["--maxkb=1024"]
+      - id: detect-private-key
+
+  # Python lint — same pinned version as the `ruff` dev dependency and CI, so
+  # the three can never disagree.
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.0
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+
+  # Next.js apps: eslint on staged files, via each app's own local config.
+  # (tsc is whole-project and slow, so type-checking lives in CI, not here.)
+  - repo: local
+    hooks:
+      - id: eslint-dashboard
+        name: eslint (dashboard)
+        language: system
+        entry: bash -c 'cd dashboard && npx eslint --max-warnings=0 "${@#dashboard/}"' --
+        files: ^dashboard/.*\.(ts|tsx)$
+        pass_filenames: true
+      - id: eslint-clinic-site
+        name: eslint (clinic-site)
+        language: system
+        entry: bash -c 'cd clinic-site && npx eslint --max-warnings=0 "${@#clinic-site/}"' --
+        files: ^clinic-site/.*\.(ts|tsx)$
+        pass_filenames: true

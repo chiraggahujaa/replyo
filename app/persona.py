@@ -14,6 +14,7 @@ so a perfect first draft isn't the bar.
 from __future__ import annotations
 
 import logging
+from typing import cast
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -82,4 +83,5 @@ async def generate_system_prompt(*, tenant_id: str, name: str, notes: str) -> st
     )
     model = get_chat_model(temperature=0.4)
     reply = model.invoke([SystemMessage(content=_META_PROMPT), HumanMessage(content=user)])
-    return reply.content.strip()
+    # Text-only chat: content is always a str here (the list form is multimodal-only).
+    return cast(str, reply.content).strip()

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useRef, useState } from "react";
 import {
   KnowledgeSource,
   addWebsite,
@@ -8,6 +8,7 @@ import {
   listKnowledge,
   uploadDocument,
 } from "@/lib/api";
+import { useLiveResource, useRefetch } from "@/lib/live";
 import { Badge, Button, Skeleton, Spinner, TextInput } from "./ui";
 import {
   BookIcon,
@@ -35,35 +36,20 @@ export function KnowledgeManager({ tenantId }: { tenantId: string }) {
   const [loaded, setLoaded] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
 
-  const refresh = useCallback(async () => {
+  // Live ingestion status: crawl/status writes push over the websocket (each one fires
+  // the admin_change_notify trigger), with 3s polling as the fallback. Errors must
+  // propagate out of refetch — they drive the hook's connectivity tracking.
+  const refetch = useRefetch(async () => {
     try {
       setSources(await listKnowledge(tenantId));
-    } catch {
-      /* transient */
+    } finally {
+      setLoaded(true);
     }
-  }, [tenantId]);
-
-  // Poll while anything is still ingesting so the crawl counter ticks up live. The load
-  // is inlined (not a synchronous refresh() call) so setState only happens post-await.
-  useEffect(() => {
-    let cancelled = false;
-    async function load() {
-      try {
-        const data = await listKnowledge(tenantId);
-        if (!cancelled) setSources(data);
-      } catch {
-        /* transient */
-      } finally {
-        if (!cancelled) setLoaded(true);
-      }
-    }
-    load();
-    const t = setInterval(load, 3000);
-    return () => {
-      cancelled = true;
-      clearInterval(t);
-    };
-  }, [tenantId]);
+  });
+  // `refresh` (post-action refetch for upload/add/delete) goes through the hook's
+  // single-flight coalescer, so it can't race a socket-pushed refetch out of order
+  // and land a stale snapshot over the final status. It never rejects.
+  const { refresh } = useLiveResource({ tenantId, topic: "knowledge", refetch, pollMs: 3000 });
 
   async function onUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const files = Array.from(e.target.files || []);
