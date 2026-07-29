@@ -1,6 +1,7 @@
 """Ingest the demo persona's documents into its pgvector collection.
 
-Reads every `*.md` in `data/`, splits each into overlapping chunks, embeds them, and
+Reads every `*.md` in `data/sample-personas/brightsmile-dental/`, splits each into
+overlapping chunks, embeds them, and
 writes them to the DEMO tenant's collection — the seed persona that the clinic-site and
 the single-tenant channels use. Re-running is safe: it wipes and rebuilds the collection.
 
@@ -21,7 +22,9 @@ from app.knowledge import CHUNK_OVERLAP, CHUNK_SIZE
 from app.rag import build_store, collection_name
 from app.tenancy import DEMO_TENANT_ID
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+DATA_DIR = (
+    Path(__file__).resolve().parent.parent / "data" / "sample-personas" / "brightsmile-dental"
+)
 
 
 def main() -> None:

@@ -156,11 +156,11 @@ present.
    database that already has the table. The pgvector store's own table is created automatically on
    first ingest (next step).
 
-5. **Ingest the clinic documents into pgvector (one time, re-run after editing `data/`):**
+5. **Ingest the clinic documents into pgvector (one time, re-run after editing `data/sample-personas/brightsmile-dental/`):**
    ```bash
    uv run python scripts/ingest_docs.py
    ```
-   This embeds every `data/*.md` file so the `question` intent can answer from them.
+   This embeds every `data/sample-personas/brightsmile-dental/*.md` file so the `question` intent can answer from them.
 
 6. **(Optional) Google Calendar for real bookings.** Skip this and booking uses an
    in-memory calendar (works, but not persisted). For real events:
@@ -214,7 +214,7 @@ npm install          # first time only
 npm run dev          # http://localhost:3000
 ```
 A full BrightSmile Dental site (services, pricing, patient info, visit us) with the assistant
-embedded. Its content is transcribed from `data/*.md` into `clinic-site/lib/content.ts` — the same
+embedded. Its content is transcribed from `data/sample-personas/brightsmile-dental/*.md` into `clinic-site/lib/content.ts` — the same
 documents the assistant answers from, so the page and the chat bubble agree. **Change a price in
 one, change it in the other.**
 
@@ -316,15 +316,18 @@ app/
   static/
     widget.js          # embeddable chat widget (Shadow DOM, websocket + HTTP fallback)
   realtime.py          # Postgres LISTEN/NOTIFY hub -> pushes to widget + dashboard sockets
-data/                  # clinic documents (pricing, services, policies, hours)
-clinic-site/           # Next.js clinic website (embeds the widget; content from data/)
+data/
+  sample-personas/     # sample persona documents, one folder per persona
+    brightsmile-dental/  # demo clinic docs (pricing, services, policies, hours)
+    riverbend-wellness-spa/
+clinic-site/           # Next.js clinic website (embeds the widget; content from the demo persona docs)
 dashboard/             # Next.js approval dashboard (live over websocket, polls as fallback)
 supabase/
   migrations/          # SQL migrations for app-owned tables (pending_reviews, …)
 scripts/
   setup_checkpointer.py
   migrate.py           # apply supabase/migrations via `supabase db push` (reads DATABASE_URL from .env)
-  ingest_docs.py       # chunk + embed data/*.md into pgvector
+  ingest_docs.py       # chunk + embed the demo persona's .md docs into pgvector
   run_followups.py     # send due re-engagement nudges (cron-friendly; --dry-run/--force/--loop)
   smoke_chat.py        # comprehensive live test harness (real OpenAI + Supabase)
   test_booking.py      # deterministic booking + conflict + reschedule tests (offline)

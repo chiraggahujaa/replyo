@@ -5,7 +5,8 @@ One place that owns:
   - the pgvector-backed vector store on Supabase,
   - a `retrieve()` helper the graph uses to fetch relevant document chunks.
 
-Ingestion (chunking the files in data/ and writing embeddings) lives in
+Ingestion (chunking the files in data/sample-personas/brightsmile-dental/ and
+writing embeddings) lives in
 scripts/ingest_docs.py; this module is the read side plus the shared store builder.
 """
 

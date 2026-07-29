@@ -1,7 +1,7 @@
 /**
  * All clinic content in one typed place.
  *
- * This is transcribed from `data/*.md` at the repo root — the same documents the
+ * This is transcribed from `data/sample-personas/brightsmile-dental/*.md` — the same documents the
  * Replyo assistant retrieves over (RAG). Keeping them in sync matters: if the site
  * says whitening is ₹8,000 and the docs say something else, the chat widget will
  * confidently contradict the page it's sitting on. When you change a price or a

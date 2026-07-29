@@ -26,7 +26,7 @@ from app.llm import get_chat_model
 DURATION = timedelta(minutes=30)
 
 # weekday() -> ((open_h, open_m), (close_h, close_m)); Mon=0 .. Sun=6.
-# Matches data/hours-location.md: Mon–Sat 09:30–20:00, Sun 10:00–14:00.
+# Matches data/sample-personas/brightsmile-dental/hours-location.md: Mon–Sat 09:30–20:00, Sun 10:00–14:00.
 CLINIC_HOURS: dict[int, tuple[tuple[int, int], tuple[int, int]]] = {
     0: ((9, 30), (20, 0)),
     1: ((9, 30), (20, 0)),
