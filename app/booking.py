@@ -3,16 +3,23 @@
 Responsibilities (all backend-agnostic; depends only on CalendarBackend):
   - parse a natural-language time ("Saturday around 3pm", "next Tue morning",
     "the second option") into a concrete slot, via the LLM,
-  - snap it into the clinic's opening hours and 30-minute grid,
+  - snap it into the business's opening hours and appointment grid,
   - check availability, and on a conflict propose the next free alternatives,
   - create the event when the slot is free.
 
 `try_book()` is pure orchestration with injectable `now` and `parse` so the whole
 conflict flow is unit-testable without OpenAI or Google.
+
+Per-persona hours/slot length arrive as KEYWORD-ONLY arguments whose defaults are the
+old hardcoded constants (CLINIC_HOURS, DURATION, no buffer). That shape is deliberate:
+every existing caller and test keeps working untouched, and a persona that has curated
+hours (business_profiles.hours, converted by app/catalog.py hours_from_profile) simply
+passes them in. This module stays free of database and tenant concepts.
 """
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -23,10 +30,13 @@ from app.calendar.base import CalendarBackend
 from app.config import settings
 from app.llm import get_chat_model
 
+logger = logging.getLogger("replyo.booking")
+
 DURATION = timedelta(minutes=30)
 
 # weekday() -> ((open_h, open_m), (close_h, close_m)); Mon=0 .. Sun=6.
-# Matches data/sample-personas/brightsmile-dental/hours-location.md: Mon–Sat 09:30–20:00, Sun 10:00–14:00.
+# The FALLBACK hours, used when a persona has no curated hours of its own. Matches
+# data/sample-personas/brightsmile-dental/hours-location.md: Mon–Sat 09:30–20:00, Sun 10:00–14:00.
 CLINIC_HOURS: dict[int, tuple[tuple[int, int], tuple[int, int]]] = {
     0: ((9, 30), (20, 0)),
     1: ((9, 30), (20, 0)),
@@ -37,9 +47,33 @@ CLINIC_HOURS: dict[int, tuple[tuple[int, int], tuple[int, int]]] = {
     6: ((10, 0), (14, 0)),
 }
 
+# The hours shape both CLINIC_HOURS and hours_from_profile speak.
+Hours = dict[int, tuple[tuple[int, int], tuple[int, int]]]
+
 
 def clinic_tz() -> ZoneInfo:
+    """The deployment-wide default timezone (CLINIC_TIMEZONE)."""
     return ZoneInfo(settings.clinic_timezone)
+
+
+def tenant_tz(tenant: dict | None) -> ZoneInfo:
+    """This persona's timezone, falling back to CLINIC_TIMEZONE.
+
+    `tenants.timezone` is owner-supplied text, so an invalid or typo'd IANA name must
+    never raise into a booking turn — a customer would get an error instead of a slot.
+    We log and fall back, which is wrong by a few hours at worst and self-evident in the
+    logs, rather than fatal.
+    """
+    name = (tenant or {}).get("timezone")
+    if isinstance(name, str) and name.strip():
+        try:
+            return ZoneInfo(name.strip())
+        except Exception:
+            logger.warning(
+                "Persona timezone %r is not a valid IANA name — falling back to %s",
+                name, settings.clinic_timezone,
+            )
+    return clinic_tz()
 
 
 def format_slot(dt: datetime) -> str:
@@ -49,36 +83,62 @@ def format_slot(dt: datetime) -> str:
     return f"{dt:%a %d %b}, {hour12}:{dt.minute:02d} {ampm}"
 
 
-def iter_slots(after: datetime, tz: ZoneInfo, days: int = 14):
-    """Yield (start, end) 30-min slots within clinic hours, on/after `after`."""
+def _grid(slot: int | None, buffer: int | None) -> tuple[timedelta, timedelta]:
+    """(appointment length, grid step) from slot/buffer minutes.
+
+    The appointment is `slot` long; the next one starts `slot + buffer` later, so the
+    buffer is turnaround time the customer never sees. Non-positive/None values fall
+    back to the defaults — a zero step would make iter_slots loop forever.
+    """
+    length = timedelta(minutes=slot) if slot and slot > 0 else DURATION
+    pad = timedelta(minutes=buffer) if buffer and buffer > 0 else timedelta()
+    return length, length + pad
+
+
+def iter_slots(
+    after: datetime, tz: ZoneInfo, days: int = 14, *,
+    hours: Hours | None = None, slot: int | None = None, buffer: int | None = None,
+):
+    """Yield (start, end) appointment slots within opening hours, on/after `after`.
+
+    Defaults reproduce the original behaviour exactly: CLINIC_HOURS, 30-minute
+    appointments, no buffer.
+    """
+    week = CLINIC_HOURS if hours is None else hours
+    length, step = _grid(slot, buffer)
     for d in range(days + 1):
         day = (after + timedelta(days=d)).date()
-        hours = CLINIC_HOURS.get(day.weekday())
-        if not hours:
+        window = week.get(day.weekday())
+        if not window:  # closed that day
             continue
-        (oh, om), (ch, cm) = hours
+        (oh, om), (ch, cm) = window
         start = datetime(day.year, day.month, day.day, oh, om, tzinfo=tz)
         close = datetime(day.year, day.month, day.day, ch, cm, tzinfo=tz)
-        while start + DURATION <= close:
+        while start + length <= close:
             if start >= after:
-                yield start, start + DURATION
-            start += DURATION
+                yield start, start + length
+            start += step
 
 
-def snap_to_clinic(target: datetime, now: datetime, tz: ZoneInfo):
-    """First clinic slot at/after max(target, now). None if none within horizon."""
+def snap_to_clinic(
+    target: datetime, now: datetime, tz: ZoneInfo, *,
+    hours: Hours | None = None, slot: int | None = None, buffer: int | None = None,
+):
+    """First open slot at/after max(target, now). None if none within horizon."""
     after = max(target, now)
-    for start, end in iter_slots(after, tz):
+    for start, end in iter_slots(after, tz, hours=hours, slot=slot, buffer=buffer):
         return start, end
     return None
 
 
 def find_available(after: datetime, tz: ZoneInfo, calendar: CalendarBackend,
-                   count: int = 3, exclude: set[datetime] | None = None):
+                   count: int = 3, exclude: set[datetime] | None = None, *,
+                   hours: Hours | None = None, slot: int | None = None,
+                   buffer: int | None = None):
     """Return up to `count` free (start, end) slots on/after `after`."""
     exclude = exclude or set()
     out = []
-    for start, end in iter_slots(after, tz):
+    for start, end in iter_slots(after, tz, hours=hours, slot=slot, buffer=buffer):
         if start in exclude:
             continue
         if calendar.is_free(start, end):
@@ -183,8 +243,11 @@ def reserve_slot(
     *,
     now: datetime,
     tz: ZoneInfo,
+    hours: Hours | None = None,
+    slot: int | None = None,
+    buffer: int | None = None,
 ) -> dict:
-    """Reserve a concrete `target` time: snap to the clinic grid, check the calendar,
+    """Reserve a concrete `target` time: snap to the appointment grid, check the calendar,
     then create the event or return a conflict with alternatives.
 
     Split out from try_book so callers that already resolved a time (e.g. a reschedule,
@@ -192,7 +255,7 @@ def reserve_slot(
     availability/creation logic without parsing text again. Returns the same result
     shapes as try_book.
     """
-    snapped = snap_to_clinic(target, now, tz)
+    snapped = snap_to_clinic(target, now, tz, hours=hours, slot=slot, buffer=buffer)
     if snapped is None:
         return {"status": "need_time"}
     start, end = snapped
@@ -207,7 +270,9 @@ def reserve_slot(
         )
         return {"status": "confirmed", "start": start, "event_id": event_id}
 
-    alternatives = find_available(start, tz, calendar, count=3, exclude={start})
+    alternatives = find_available(
+        start, tz, calendar, count=3, exclude={start}, hours=hours, slot=slot, buffer=buffer
+    )
     return {"status": "conflict", "requested": start, "alternatives": [s for s, _ in alternatives]}
 
 
@@ -218,6 +283,10 @@ def try_book(
     *,
     now: datetime | None = None,
     parse: ParseFn | None = None,
+    tz: ZoneInfo | None = None,
+    hours: Hours | None = None,
+    slot: int | None = None,
+    buffer: int | None = None,
 ) -> dict:
     """Attempt to book from a ready booking_info by parsing a time out of `user_text`.
 
@@ -225,7 +294,7 @@ def try_book(
       {"status": "confirmed", "start", "event_id"}         -> event created
       {"status": "conflict", "requested", "alternatives"}  -> slot busy; alternatives offered
     """
-    tz = clinic_tz()
+    tz = tz or clinic_tz()
     now = now or datetime.now(tz)
     parse = parse or parse_requested_time  # resolved here so tests can monkeypatch
     options = booking.get("alternatives_iso")
@@ -238,4 +307,6 @@ def try_book(
     if target.tzinfo is None:
         target = target.replace(tzinfo=tz)
 
-    return reserve_slot(booking, calendar, target, now=now, tz=tz)
+    return reserve_slot(
+        booking, calendar, target, now=now, tz=tz, hours=hours, slot=slot, buffer=buffer
+    )

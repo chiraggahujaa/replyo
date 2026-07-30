@@ -19,7 +19,10 @@ from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, 
 from psycopg.types.json import Jsonb
 from pydantic import BaseModel, Field, field_validator
 
-from app import extraction
+from app import extraction, storage
+from app.catalog import HHMM
+from app.config import settings
+from app.currency import CURRENCY_CODES
 from app.knowledge import ingest_upload, ingest_website
 from app.persona import generate_system_prompt
 from app.rag import build_store
@@ -84,6 +87,23 @@ def _not_blank(value: str | None) -> str | None:
     return value
 
 
+def _valid_currency(value: str | None) -> str | None:
+    """Shared validator body: a supported currency code, or None/blank to clear it.
+
+    Replyo is single-currency (app/currency.py) and catalog_items has a matching CHECK,
+    so an unsupported code has to fail at the edge with a readable 422 rather than as a
+    500 from the database. Blank means "no currency stated", which is a legitimate value.
+    """
+    if value is None:
+        return None
+    code = value.strip().upper()
+    if not code:
+        return None
+    if code not in CURRENCY_CODES:
+        raise ValueError(f"must be one of: {', '.join(sorted(CURRENCY_CODES))}")
+    return code
+
+
 class CreateCatalogItem(BaseModel):
     kind: Literal["service", "product"]
     name: str = Field(..., max_length=200)
@@ -95,6 +115,7 @@ class CreateCatalogItem(BaseModel):
     category: str | None = Field(None, max_length=50)
 
     _name_not_blank = field_validator("name")(_not_blank)
+    _currency_supported = field_validator("currency")(_valid_currency)
 
 
 class UpdateCatalogItem(BaseModel):
@@ -110,6 +131,42 @@ class UpdateCatalogItem(BaseModel):
     category: str | None = Field(None, max_length=50)
 
     _name_not_blank = field_validator("name")(_not_blank)
+    _currency_supported = field_validator("currency")(_valid_currency)
+
+
+class UpdateBusinessSettings(BaseModel):
+    """PATCH body for the opening hours + appointment settings (business_profiles).
+
+    Any subset; an omitted field is left untouched. Editing `hours` flips
+    hours_status to 'edited' and editing slot/buffer flips settings_status, which is what
+    stops the next extraction run from overwriting the owner's word (see app/extraction.py
+    _finish). `hours` uses the stored shape — weekday index as a STRING key, null for a
+    closed day — validated here so nothing malformed can reach the jsonb column.
+    """
+
+    hours: dict[str, dict[str, str] | None] | None = None
+    slot_minutes: int | None = Field(None, ge=5, le=240)
+    buffer_minutes: int | None = Field(None, ge=0, le=120)
+
+    @field_validator("hours")
+    @classmethod
+    def _valid_hours(cls, value: dict | None) -> dict | None:
+        if value is None:
+            return None
+        cleaned: dict[str, dict[str, str] | None] = {}
+        for key, window in value.items():
+            if key not in {"0", "1", "2", "3", "4", "5", "6"}:
+                raise ValueError('keys must be weekday indexes as strings, "0" (Mon) .. "6" (Sun)')
+            if window is None:
+                cleaned[key] = None  # closed that day
+                continue
+            opens, closes = str(window.get("open", "")), str(window.get("close", ""))
+            if not (HHMM.match(opens) and HHMM.match(closes)):
+                raise ValueError(f'day {key}: open/close must be 24-hour "HH:MM"')
+            if opens >= closes:
+                raise ValueError(f"day {key}: close must be later than open")
+            cleaned[key] = {"open": opens, "close": closes}
+        return cleaned
 
 
 class CreateSnippet(BaseModel):
@@ -349,7 +406,69 @@ async def get_catalog(tenant: dict = Depends(_require_tenant)) -> dict:
             "error": profile["extraction_error"] if profile else None,
             "last_extracted_at": profile["last_extracted_at"] if profile else None,
         },
+        # Opening hours + appointment settings. A persona with no profile row yet reports
+        # the column defaults, so the console renders one state, not two.
+        "settings": {
+            "hours": (profile or {}).get("hours"),
+            "slot_minutes": (profile or {}).get("slot_minutes") or 30,
+            "buffer_minutes": (profile or {}).get("buffer_minutes") or 0,
+            "hours_status": (profile or {}).get("hours_status") or "extracted",
+            "settings_status": (profile or {}).get("settings_status") or "extracted",
+        },
+        # Whether the image endpoints below will work at all, so the console can disable
+        # the picker with an explanation instead of showing a 503 after a 5 MB upload.
+        "storage_enabled": settings.storage_enabled,
     }
+
+
+@router.patch("/personas/active/catalog/settings")
+async def update_business_settings(
+    body: UpdateBusinessSettings, tenant: dict = Depends(_require_tenant)
+) -> dict:
+    """Edit the opening hours / appointment settings; the edited half becomes the owner's word.
+
+    Two status flags, flipped independently: touching `hours` sets hours_status='edited',
+    touching slot/buffer sets settings_status='edited'. From then on extraction refreshes
+    only the half the owner hasn't claimed (app/extraction.py _finish). The row is
+    upserted because a persona that has never run an extraction has no profile row yet —
+    editing hours must not require extracting first.
+    """
+    fields = body.model_dump(exclude_unset=True)
+    if not fields:
+        return {}
+    sets: list[str] = []
+    params: dict[str, object] = {"tenant_id": str(tenant["id"])}
+    if "hours" in fields:
+        sets.append("hours = %(hours)s, hours_status = 'edited'")
+        params["hours"] = Jsonb(fields["hours"]) if fields["hours"] is not None else None
+    for col in ("slot_minutes", "buffer_minutes"):
+        if col in fields and fields[col] is not None:
+            sets.append(f"{col} = %({col})s")
+            params[col] = fields[col]
+    if any(c in fields and fields[c] is not None for c in ("slot_minutes", "buffer_minutes")):
+        sets.append("settings_status = 'edited'")
+
+    async with await scoped_connection(tenant_id=str(tenant["id"])) as conn:
+        row = await (await conn.execute(
+            # Column names come from the whitelisted pydantic model, never the client.
+            f"""insert into business_profiles (tenant_id) values (%(tenant_id)s)
+                on conflict (tenant_id) do update
+                       set {", ".join(sets)}, updated_at = now()
+                 returning *""",  # pyright: ignore[reportArgumentType]
+            params,
+        )).fetchone()
+    if not row:
+        # The INSERT branch won (first ever edit): the row now exists with defaults, so
+        # re-run to apply the values on the conflict path.
+        async with await scoped_connection(tenant_id=str(tenant["id"])) as conn:
+            row = await (await conn.execute(
+                f"update business_profiles set {', '.join(sets)}, updated_at = now() "  # pyright: ignore[reportArgumentType]
+                "where tenant_id = %(tenant_id)s returning *",
+                params,
+            )).fetchone()
+    if not row:
+        raise HTTPException(404, "Persona not found")
+    return row
 
 
 @router.post("/personas/active/catalog/items", status_code=201)
@@ -402,8 +521,106 @@ async def update_catalog_item(
 
 @router.delete("/personas/active/catalog/items/{item_id}", status_code=204)
 async def delete_catalog_item(item_id: str, tenant: dict = Depends(_require_tenant)) -> None:
-    async with await scoped_connection(tenant_id=str(tenant["id"])) as conn:
-        await conn.execute("delete from catalog_items where id = %s", (item_id,))
+    """Remove the row, then its stored image — deleting a product must not orphan its file."""
+    tid = str(tenant["id"])
+    async with await scoped_connection(tenant_id=tid) as conn:
+        # RETURNING gives us the URL of a row we definitely deleted, so we never delete an
+        # object that is still referenced (and read+delete can't race each other).
+        row = await (await conn.execute(
+            "delete from catalog_items where id = %s and tenant_id = %s returning image_url",
+            (item_id, tid),
+        )).fetchone()
+    if row and row["image_url"]:
+        # Best-effort and last: the owner asked for the row to be gone, and it is. An
+        # unreachable bucket must not turn a successful delete into a 500 (the helper
+        # logs and swallows), it just leaves a few KB behind.
+        await storage.delete_catalog_image(row["image_url"])
+
+
+# --- product images (Supabase Storage; app/storage.py owns the bucket calls) -------
+
+@router.post("/personas/active/catalog/items/{item_id}/image")
+async def upload_catalog_item_image(
+    item_id: str, file: UploadFile, tenant: dict = Depends(_require_tenant)
+) -> dict:
+    """Store one product photo and point the row at its CDN URL.
+
+    Order matters: upload first, then flip the column, then delete the OLD object. A
+    failure at any earlier step therefore leaves the item showing the picture it had, and
+    the worst case is an orphaned file rather than a row pointing at nothing.
+
+    The image is only ever attached to a product (a service has no photo slot in the
+    widget), and the file itself is validated by app/storage.py — its ValueError is the
+    operator's/owner's problem (400 with the message), StorageNotConfigured is the
+    deployment's (503), and a refusal from Storage itself is an upstream failure (502).
+    """
+    tid = str(tenant["id"])
+    async with await scoped_connection(tenant_id=tid) as conn:
+        row = await (await conn.execute(
+            "select kind, image_url from catalog_items where id = %s and tenant_id = %s",
+            (item_id, tid),
+        )).fetchone()
+    if not row:
+        raise HTTPException(404, "Catalog item not found")
+    if row["kind"] != "product":
+        raise HTTPException(400, "Images are only supported for products")
+    if not settings.storage_enabled:
+        # Checked before reading the body so a misconfigured deployment answers instantly
+        # instead of after a 5 MB upload.
+        raise HTTPException(
+            503,
+            "Image storage is not configured — set SUPABASE_SERVICE_ROLE_KEY and run "
+            "scripts/setup_storage.py.",
+        )
+
+    data = await file.read()
+    try:
+        url = await storage.upload_catalog_image(tenant_id=tid, item_id=item_id, data=data)
+    except storage.StorageNotConfigured as exc:  # a RuntimeError — must precede that arm
+        raise HTTPException(503, str(exc)) from None
+    except ValueError as exc:  # empty / too large / not a PNG-JPEG-WebP
+        raise HTTPException(400, str(exc)) from None
+    except RuntimeError as exc:  # Storage answered 4xx/5xx — not the caller's fault
+        raise HTTPException(502, str(exc)) from None
+
+    async with await scoped_connection(tenant_id=tid) as conn:
+        updated = await (await conn.execute(
+            "update catalog_items set image_url = %s, status = 'edited', updated_at = now() "
+            "where id = %s and tenant_id = %s returning *",
+            (url, item_id, tid),
+        )).fetchone()
+    if not updated:
+        # The item was deleted while we were uploading: bin the object we just wrote.
+        await storage.delete_catalog_image(url)
+        raise HTTPException(404, "Catalog item not found")
+    if row["image_url"] and row["image_url"] != url:
+        await storage.delete_catalog_image(row["image_url"])
+    return updated
+
+
+@router.delete("/personas/active/catalog/items/{item_id}/image")
+async def delete_catalog_item_image(
+    item_id: str, tenant: dict = Depends(_require_tenant)
+) -> dict:
+    """Clear a product's photo (row first, object after) and return the updated item."""
+    tid = str(tenant["id"])
+    async with await scoped_connection(tenant_id=tid) as conn:
+        # RETURNING gives the NEW row (image_url already null), so the old URL is read
+        # first — in the same connection, so both statements share the tenant scope.
+        previous = await (await conn.execute(
+            "select image_url from catalog_items where id = %s and tenant_id = %s",
+            (item_id, tid),
+        )).fetchone()
+        row = await (await conn.execute(
+            "update catalog_items set image_url = null, status = 'edited', updated_at = now() "
+            "where id = %s and tenant_id = %s returning *",
+            (item_id, tid),
+        )).fetchone()
+    if not row:
+        raise HTTPException(404, "Catalog item not found")
+    if previous and previous["image_url"]:
+        await storage.delete_catalog_image(previous["image_url"])
+    return row
 
 
 @router.post("/personas/active/catalog/snippets", status_code=201)

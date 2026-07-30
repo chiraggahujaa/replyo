@@ -26,6 +26,16 @@ class Settings(BaseSettings):
     # the verifier picks HS256 vs JWKS from each token's `alg` header).
     supabase_url: str = ""
     supabase_jwt_secret: str = ""
+    # Service-role key (Supabase -> Project Settings -> API). SERVER-ONLY: it bypasses
+    # RLS entirely, so it must never be sent to a browser, embedded in a page, or
+    # logged. Used for one thing — writing/deleting product images in Supabase Storage
+    # (app/storage.py); leave blank to disable image upload rather than half-enable it.
+    supabase_service_role_key: str = ""
+
+    @property
+    def storage_enabled(self) -> bool:
+        """Whether product-image upload is available (bucket writes need both values)."""
+        return bool(self.supabase_url and self.supabase_service_role_key)
 
     # --- Telegram ---
     telegram_bot_token: str = ""

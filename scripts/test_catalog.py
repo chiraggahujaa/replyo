@@ -28,10 +28,10 @@ def _batch(items=(), snippets=()):
 def test_merge_items():
     print("\n\033[1m1) _merge — item dedupe\033[0m")
 
-    poor = ExtractedItem(kind="service", name="Teeth Cleaning", price_text="AED 300")
+    poor = ExtractedItem(kind="service", name="Teeth Cleaning", price_text="₹1,500")
     rich = ExtractedItem(
         kind="service", name="  teeth   CLEANING ", description="Scale and polish",
-        price_amount=300.0, currency="AED",
+        price_amount=1500.0, currency="INR",
     )
     items, _ = _merge([(_batch([poor]), "pricelist.md"), (_batch([rich]), "https://x.com/services")])
     check("same name, different case/whitespace -> one item", len(items) == 1, str(len(items)))
@@ -39,11 +39,12 @@ def test_merge_items():
     check("richer candidate wins (its description kept)", it["description"] == "Scale and polish")
     check("winner's batch source attached", it["source"] == "https://x.com/services", str(it["source"]))
     check("field coalesce: winner's gap filled from loser (price_text)",
-          it["price_text"] == "AED 300", str(it["price_text"]))
+          it["price_text"] == "₹1,500", str(it["price_text"]))
     check("winner's own fields survive the coalesce",
-          it["price_amount"] == 300.0 and it["currency"] == "AED")
+          it["price_amount"] == 1500.0 and it["currency"] == "INR",
+          f"{it['price_amount']!r} / {it['currency']!r}")
 
-    a = ExtractedItem(kind="product", name="Whitening Kit", price_text="AED 250")
+    a = ExtractedItem(kind="product", name="Whitening Kit", price_text="₹5,000")
     b = ExtractedItem(kind="product", name="whitening kit", category="Retail")
     items, _ = _merge([(_batch([a]), "s1"), (_batch([b]), "s2")])
     check("richness tie -> first candidate wins (name + source)",
@@ -87,9 +88,9 @@ def test_catalog_block():
     print("\n\033[1m3) build_catalog_block\033[0m")
 
     items = [
-        {"kind": "service", "name": "Teeth Cleaning", "price_text": "AED 300",
+        {"kind": "service", "name": "Teeth Cleaning", "price_text": "₹1,500",
          "duration_min": 30, "description": "Scale and polish."},
-        {"kind": "product", "name": "Whitening Kit", "price_amount": 250, "currency": "AED"},
+        {"kind": "product", "name": "Whitening Kit", "price_amount": 5000, "currency": "INR"},
     ]
     facts = [{"kind": "content", "title": "Location", "body": "Downtown Dubai."}]
     block = build_catalog_block(items, facts)
@@ -97,10 +98,12 @@ def test_catalog_block():
     assert block is not None
     check("authoritative header present", block.startswith("OFFICIAL BUSINESS CATALOG"))
     check("service line renders price + duration + description",
-          "- Teeth Cleaning — AED 300, 30 min. Scale and polish." in block, block)
+          "- Teeth Cleaning — ₹1,500, 30 min. Scale and polish." in block, block)
     check("Services/Products/Key facts sections present",
           "Services:" in block and "Products:" in block and "Key facts:" in block)
-    check("product falls back to currency + amount", "- Whitening Kit — AED 250." in block, block)
+    # No price_text on this row, so _item_line renders the amount through
+    # app/currency.format_amount — symbol + Indian digit grouping, not "INR 5000".
+    check("product falls back to formatted amount", "- Whitening Kit — ₹5,000." in block, block)
     check("fact renders as 'title: body'", "- Location: Downtown Dubai." in block)
 
     long_desc = "x" * 500

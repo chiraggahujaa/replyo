@@ -163,6 +163,30 @@ export type CatalogSnippet = {
   updated_at: string;
 };
 
+/** Opening hours keyed "0" (Monday) … "6" (Sunday). A null (or absent) day is closed. */
+export type BusinessHours = Record<string, { open: string; close: string } | null>;
+
+/** Opening hours + the appointment grid the assistant offers slots from. Extracted from
+ *  knowledge, then editable; each half tracks its own extracted/edited status.
+ *
+ *  Only `hours` is nullable: a persona with no business_profiles row yet still reports the
+ *  column defaults (30 / 0 / "extracted"), so the console renders one state, not two. */
+export type CatalogSettings = {
+  hours: BusinessHours | null;
+  slot_minutes: number;
+  buffer_minutes: number;
+  hours_status: "extracted" | "edited";
+  settings_status: "extracted" | "edited";
+};
+
+/** PATCH sends any subset; whatever is sent flips that half's status to "edited" — so the
+ *  two sections must save separately, or fixing Tuesday would also claim the slot grid. */
+export type CatalogSettingsInput = {
+  hours?: BusinessHours | null;
+  slot_minutes?: number;
+  buffer_minutes?: number;
+};
+
 export type CatalogResponse = {
   items: CatalogItem[];
   snippets: CatalogSnippet[];
@@ -171,6 +195,11 @@ export type CatalogResponse = {
     error: string | null;
     last_extracted_at: string | null;
   };
+  settings: CatalogSettings;
+  /** Whether the server has object storage configured at all. False means the image
+   *  endpoints answer 503, so the console disables the picker up front rather than
+   *  letting a 5 MB upload fail. */
+  storage_enabled: boolean;
 };
 
 /** Writable item fields; PATCH sends any subset, POST requires kind + name. */
@@ -229,6 +258,46 @@ export const updateSnippet = (
   });
 export const deleteSnippet = (tenantId: string, id: string) =>
   req<void>(`/api/personas/active/catalog/snippets/${id}`, { method: "DELETE", tenantId });
+
+/** Products only (a service is a 400); png/jpeg/webp, 5 MB max; 503 when the server has
+ *  no storage configured. Multipart, so the JSON Content-Type must NOT be set — the
+ *  browser has to write its own boundary (same shape as uploadDocument). */
+export async function uploadCatalogImage(
+  tenantId: string,
+  itemId: string,
+  file: File,
+): Promise<CatalogItem> {
+  const { data } = await supabase.auth.getSession();
+  const form = new FormData();
+  form.append("file", file);
+  const path = `/api/personas/active/catalog/items/${itemId}/image`;
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: "POST",
+    headers: {
+      "X-Tenant-Id": tenantId,
+      ...(data.session ? { Authorization: `Bearer ${data.session.access_token}` } : {}),
+    },
+    body: form,
+  });
+  // Same message shape as req() so callers can pull a FastAPI `detail` out of it.
+  if (!res.ok) throw new Error(`POST ${path} -> ${res.status} ${await res.text().catch(() => "")}`);
+  return res.json();
+}
+
+export const deleteCatalogImage = (tenantId: string, itemId: string) =>
+  req<CatalogItem>(`/api/personas/active/catalog/items/${itemId}/image`, {
+    method: "DELETE",
+    tenantId,
+  });
+
+// ---- catalog settings (opening hours + appointment grid) ----
+
+export const updateCatalogSettings = (tenantId: string, body: CatalogSettingsInput) =>
+  req<CatalogSettings>("/api/personas/active/catalog/settings", {
+    method: "PATCH",
+    tenantId,
+    body: JSON.stringify(body),
+  });
 // 202 always (idempotent while a run is in flight); 409 "Add knowledge first" when the
 // persona has no ready knowledge sources to extract from.
 export const triggerExtraction = (tenantId: string) =>

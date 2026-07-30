@@ -13,9 +13,11 @@ import {
   type CatalogItem,
   type CatalogItemInput,
   type CatalogResponse,
+  type CatalogSettings,
   type CatalogSnippet,
   createCatalogItem,
   createSnippet,
+  deleteCatalogImage,
   deleteCatalogItem,
   deleteSnippet,
   getCatalog,
@@ -23,7 +25,9 @@ import {
   triggerExtraction,
   updateCatalogItem,
   updateSnippet,
+  uploadCatalogImage,
 } from "@/lib/api";
+import { CURRENCIES, DEFAULT_CURRENCY, formatPrice } from "@/lib/currency";
 import { Shell } from "../components/Shell";
 import { useReplyo } from "../providers";
 import {
@@ -32,6 +36,7 @@ import {
   Card,
   EmptyState,
   PageHeader,
+  Select,
   SkeletonCard,
   Spinner,
   Tabs,
@@ -45,37 +50,41 @@ import {
   BookIcon,
   CheckIcon,
   ClockIcon,
+  ImageIcon,
   LayersIcon,
   PencilIcon,
   PlusIcon,
   RefreshIcon,
   TrashIcon,
+  UploadIcon,
   WandIcon,
 } from "../components/icons";
+import { HoursPanel } from "./HoursPanel";
+import { Field, StatusBadge, errText } from "./parts";
 
 const POLL_MS = 3000;
-// Two-click confirms (re-extract, delete) fall back to the safe label after this.
+// Two-click confirms (re-extract, delete, remove photo) fall back to the safe label
+// after this.
 const CONFIRM_MS = 3200;
 
-type TabKey = "service" | "product" | "guideline" | "content";
 type ItemKind = "service" | "product";
 type SnippetKind = "guideline" | "content";
+/** The four tabs backed by catalog rows. "hours" is the fifth tab — a settings editor,
+ *  not a list, so it has no add label, plural or count. */
+type EntryKind = ItemKind | SnippetKind;
+type TabKey = EntryKind | "hours";
 
-const TAB_META: Record<TabKey, { label: string; add: string; plural: string }> = {
+const TAB_META: Record<EntryKind, { label: string; add: string; plural: string }> = {
   service: { label: "Services", add: "Add service", plural: "services" },
   product: { label: "Products", add: "Add product", plural: "products" },
   guideline: { label: "Guidelines", add: "Add guideline", plural: "guidelines" },
   content: { label: "Content", add: "Add note", plural: "notes" },
 };
 
-/** Surface a FastAPI error `detail` when the response carried one; otherwise fall back. */
-function errText(e: unknown, fallback: string): string {
-  if (e instanceof Error && e.message) {
-    const m = e.message.match(/"detail"\s*:\s*"([^"]+)"/);
-    return m ? m[1] : fallback;
-  }
-  return fallback;
-}
+// Product photos: mirrors what the backend accepts, so a doomed upload never leaves the
+// browser.
+const IMAGE_TYPES = ["image/png", "image/jpeg", "image/webp"];
+const IMAGE_MAX_MB = 5;
 
 /* Local inserts/edits keep the API's ordering (kind, category nulls last, lower(name) /
    kind, sort, lower(title)) so a saved card lands where a reload would put it. */
@@ -103,12 +112,12 @@ const sortSnippets = (snippets: CatalogSnippet[]) =>
       a.title.toLowerCase().localeCompare(b.title.toLowerCase()),
   );
 
-/** price_text verbatim, else formatted amount + currency, else null ("No price"). */
+/** price_text verbatim (it's the owner's own wording), else the formatted amount, else
+ *  null ("No price"). Everything that shows a price goes through here. */
 function priceLabel(item: CatalogItem): string | null {
   if (item.price_text) return item.price_text;
   if (item.price_amount === null) return null;
-  const amount = item.price_amount.toLocaleString(undefined, { maximumFractionDigits: 2 });
-  return item.currency ? `${item.currency} ${amount}` : amount;
+  return formatPrice(item.price_amount, item.currency);
 }
 
 export default function CatalogPage() {
@@ -296,6 +305,20 @@ function Catalog({ tenantId, personaName }: { tenantId: string; personaName: str
     pushToast("success", "Deleted");
   };
 
+  // A photo upload/removal writes the row immediately (it needs the item id), so the
+  // card behind the editor has to reflect it even if the user then cancels. Deliberately
+  // NOT closeEditor()/sorting: the owner is still mid-edit, and an image can't change
+  // where the row sorts.
+  const handleItemPatched = (updated: CatalogItem) => {
+    setData(
+      (d) => d && { ...d, items: d.items.map((i) => (i.id === updated.id ? updated : i)) },
+    );
+  };
+
+  const handleSettingsSaved = (settings: CatalogSettings) => {
+    setData((d) => d && { ...d, settings });
+  };
+
   const handleSnippetSaved = (saved: CatalogSnippet, created: boolean) => {
     setData(
       (d) =>
@@ -320,17 +343,21 @@ function Catalog({ tenantId, personaName }: { tenantId: string; personaName: str
 
   const items = data?.items ?? [];
   const snippets = data?.snippets ?? [];
-  const counts: Record<TabKey, number> = {
+  const counts: Record<EntryKind, number> = {
     service: items.filter((i) => i.kind === "service").length,
     product: items.filter((i) => i.kind === "product").length,
     guideline: snippets.filter((s) => s.kind === "guideline").length,
     content: snippets.filter((s) => s.kind === "content").length,
   };
-  const tabs = (Object.keys(TAB_META) as TabKey[]).map((k) => ({
-    key: k,
-    label: TAB_META[k].label,
-    count: data ? counts[k] : undefined,
-  }));
+  const tabs = [
+    ...(Object.keys(TAB_META) as EntryKind[]).map((k) => ({
+      key: k,
+      label: TAB_META[k].label,
+      count: data ? counts[k] : undefined,
+    })),
+    // No count: hours isn't a list, and "7" would read as seven of something.
+    { key: "hours", label: "Hours & booking" },
+  ];
 
   const extraction = data?.extraction;
   const everExtracted = !!extraction?.last_extracted_at;
@@ -407,6 +434,25 @@ function Catalog({ tenantId, personaName }: { tenantId: string; personaName: str
               }
             />
           </Card>
+        ) : tab === "hours" ? (
+          loading ? (
+            <div className="space-y-6" aria-busy>
+              <SkeletonCard />
+              <SkeletonCard />
+            </div>
+          ) : (
+            // Keyed on the last extraction: a run that finishes while this panel is open
+            // has written new hours, so re-seed the form from them. Ordinary polls (and
+            // our own saves, which reconcile in place) leave the key alone, so nothing
+            // yanks the form out from under someone mid-edit.
+            <HoursPanel
+              key={extraction?.last_extracted_at ?? "never"}
+              tenantId={tenantId}
+              settings={data?.settings ?? null}
+              onSaved={handleSettingsSaved}
+              onToast={pushToast}
+            />
+          )
         ) : tab === "service" || tab === "product" ? (
           <ItemsSection
             tenantId={tenantId}
@@ -414,6 +460,9 @@ function Catalog({ tenantId, personaName }: { tenantId: string; personaName: str
             items={items.filter((i) => i.kind === tab)}
             showSkeletons={skeletonsFor(counts[tab])}
             everExtracted={everExtracted}
+            // Absent while the first load is in flight: assume "off" so the photo picker
+            // can't be clicked into a 503 before we know the server has storage at all.
+            storageEnabled={data?.storage_enabled ?? false}
             editingId={editingId}
             adding={adding}
             extractBusy={extractBusy}
@@ -425,6 +474,8 @@ function Catalog({ tenantId, personaName }: { tenantId: string; personaName: str
             onCloseEditor={closeEditor}
             onSaved={handleItemSaved}
             onDeleted={handleItemDeleted}
+            onPatched={handleItemPatched}
+            onToast={pushToast}
             onExtract={onExtract}
           />
         ) : (
@@ -463,6 +514,7 @@ function ItemsSection({
   items,
   showSkeletons,
   everExtracted,
+  storageEnabled,
   editingId,
   adding,
   extractBusy,
@@ -471,6 +523,8 @@ function ItemsSection({
   onCloseEditor,
   onSaved,
   onDeleted,
+  onPatched,
+  onToast,
   onExtract,
 }: {
   tenantId: string;
@@ -478,6 +532,7 @@ function ItemsSection({
   items: CatalogItem[];
   showSkeletons: boolean;
   everExtracted: boolean;
+  storageEnabled: boolean;
   editingId: string | null;
   adding: boolean;
   extractBusy: boolean;
@@ -486,6 +541,8 @@ function ItemsSection({
   onCloseEditor: () => void;
   onSaved: (item: CatalogItem, created: boolean) => void;
   onDeleted: (id: string) => void;
+  onPatched: (item: CatalogItem) => void;
+  onToast: (kind: ToastItem["kind"], text: string) => void;
   onExtract: () => void;
 }) {
   if (showSkeletons) {
@@ -557,9 +614,12 @@ function ItemsSection({
             tenantId={tenantId}
             kind={kind}
             item={item}
+            storageEnabled={storageEnabled}
             onCancel={onCloseEditor}
             onSaved={onSaved}
             onDeleted={onDeleted}
+            onPatched={onPatched}
+            onToast={onToast}
           />
         ) : (
           <ItemCard key={item.id} item={item} onEdit={() => onEdit(item.id)} />
@@ -570,9 +630,12 @@ function ItemsSection({
           key="new"
           tenantId={tenantId}
           kind={kind}
+          storageEnabled={storageEnabled}
           onCancel={onCloseEditor}
           onSaved={onSaved}
           onDeleted={onDeleted}
+          onPatched={onPatched}
+          onToast={onToast}
         />
       ) : (
         <AddTile label={TAB_META[kind].add} onClick={onStartAdd} className="min-h-[140px]" />
@@ -583,58 +646,76 @@ function ItemsSection({
 
 function ItemCard({ item, onEdit }: { item: CatalogItem; onEdit: () => void }) {
   const price = priceLabel(item);
+  const photo = item.kind === "product" ? item.image_url : null;
   return (
-    <Card hover className="animate-in group">
+    <Card hover className="animate-in group overflow-hidden">
       {/* The whole card expands on click (pointer convenience); the pencil button is the
           real, keyboard-reachable affordance — hover-revealed on desktop, always visible
           on touch widths. */}
-      <div className="cursor-pointer p-5" onClick={onEdit}>
-        <div className="flex items-start justify-between gap-3">
-          <div className="min-w-0">
-            {item.category && (
-              <div className="mb-1 text-[11px] font-semibold uppercase tracking-wider text-[var(--color-faint)]">
-                {item.category}
-              </div>
-            )}
-            <h3 className="font-display text-[16px] font-semibold tracking-tight">{item.name}</h3>
+      <div className="cursor-pointer" onClick={onEdit}>
+        {/* Products only, and only once there IS a photo — an empty frame on every other
+            product would be noise, not a prompt. */}
+        {photo && (
+          <div className="aspect-[4/3] w-full overflow-hidden border-b border-[var(--color-border)] bg-[var(--color-bg-soft)]">
+            {/* eslint-disable-next-line @next/next/no-img-element -- photos live on the
+                API's object storage, whose host is env-dependent at runtime; next/image
+                would need it pinned into next.config remotePatterns at build time. */}
+            <img
+              src={photo}
+              alt={item.name}
+              loading="lazy"
+              className="h-full w-full object-cover"
+            />
           </div>
-          <div className="flex shrink-0 items-center gap-1.5">
-            <StatusBadge status={item.status} />
-            <button
-              type="button"
-              onClick={(e) => {
-                e.stopPropagation();
-                onEdit();
-              }}
-              aria-label={`Edit ${item.name}`}
-              className="rounded-full p-1.5 text-[var(--color-faint)] transition-all duration-200 hover:bg-[var(--accent-wash)] hover:text-[var(--color-accent-ink)] focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring)] sm:opacity-0 sm:group-focus-within:opacity-100 sm:group-hover:opacity-100"
-            >
-              <PencilIcon className="h-3.5 w-3.5" />
-            </button>
-          </div>
-        </div>
-        {item.description && (
-          <p className="mt-2 line-clamp-2 text-[13.5px] leading-relaxed text-[var(--color-muted)]">
-            {item.description}
-          </p>
         )}
-        <div className="mt-3 flex flex-wrap items-center gap-2">
-          {/* Chip text sits in a child span resetting the Badge's uppercase/tracking:
-              price_text must render verbatim ("From AED 200" ≠ "FROM AED 200"), and a
-              same-element normal-case would lose to the kit's uppercase in CSS order. */}
-          {price ? (
-            <Badge tone="accent">
-              <span className="normal-case tracking-normal">{price}</span>
-            </Badge>
-          ) : (
-            <span className="text-[12.5px] text-[var(--color-faint)]">No price</span>
+        <div className="p-5">
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              {item.category && (
+                <div className="mb-1 text-[11px] font-semibold uppercase tracking-wider text-[var(--color-faint)]">
+                  {item.category}
+                </div>
+              )}
+              <h3 className="font-display text-[16px] font-semibold tracking-tight">{item.name}</h3>
+            </div>
+            <div className="flex shrink-0 items-center gap-1.5">
+              <StatusBadge status={item.status} />
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onEdit();
+                }}
+                aria-label={`Edit ${item.name}`}
+                className="rounded-full p-1.5 text-[var(--color-faint)] transition-all duration-200 hover:bg-[var(--accent-wash)] hover:text-[var(--color-accent-ink)] focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring)] sm:opacity-0 sm:group-focus-within:opacity-100 sm:group-hover:opacity-100"
+              >
+                <PencilIcon className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          </div>
+          {item.description && (
+            <p className="mt-2 line-clamp-2 text-[13.5px] leading-relaxed text-[var(--color-muted)]">
+              {item.description}
+            </p>
           )}
-          {item.kind === "service" && item.duration_min !== null && (
-            <Badge tone="neutral">
-              <ClockIcon className="h-3 w-3" />
-              <span className="normal-case tracking-normal">{item.duration_min} min</span>
-            </Badge>
-          )}
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            {/* Chip text sits in a child span resetting the Badge's uppercase/tracking:
+                price_text must render verbatim ("from ₹40,000" ≠ "FROM ₹40,000"), and a
+                same-element normal-case would lose to the kit's uppercase in CSS order. */}
+            {price ? (
+              <Badge tone="accent">
+                <span className="normal-case tracking-normal">{price}</span>
+              </Badge>
+            ) : (
+              <span className="text-[12.5px] text-[var(--color-faint)]">No price</span>
+            )}
+            {item.kind === "service" && item.duration_min !== null && (
+              <Badge tone="neutral">
+                <ClockIcon className="h-3 w-3" />
+                <span className="normal-case tracking-normal">{item.duration_min} min</span>
+              </Badge>
+            )}
+          </div>
         </div>
       </div>
     </Card>
@@ -645,26 +726,39 @@ function ItemEditor({
   tenantId,
   kind,
   item,
+  storageEnabled,
   onCancel,
   onSaved,
   onDeleted,
+  onPatched,
+  onToast,
 }: {
   tenantId: string;
   kind: ItemKind;
   item?: CatalogItem;
+  storageEnabled: boolean;
   onCancel: () => void;
   onSaved: (item: CatalogItem, created: boolean) => void;
   onDeleted: (id: string) => void;
+  /** A photo write lands immediately, outside Save — this reconciles the row behind the
+   *  editor without closing it or re-sorting the grid. */
+  onPatched: (item: CatalogItem) => void;
+  onToast: (kind: ToastItem["kind"], text: string) => void;
 }) {
   const uid = useId();
   const [name, setName] = useState(item?.name ?? "");
-  // One price field for the three price columns: seed from price_text, else the
-  // formatted price_amount fallback — exactly what the card shows, so a numeric-only
-  // price is visible and editable here. Any change clears price_amount/currency in
-  // the PATCH (see onSubmit); otherwise a cleared or corrected price would silently
-  // resurrect through priceLabel()'s fallback to the stale parsed amount.
-  const initialPrice = item ? (priceLabel(item) ?? "") : "";
-  const [price, setPrice] = useState(initialPrice);
+  // One control per price column — currency, amount, display text — so nothing here is
+  // derived from anything else. That's the fix for an old bug: a single free-text field
+  // seeded from priceLabel() had to guess which column the owner meant, and a cleared
+  // price resurrected through the fallback to the stale parsed amount. Now each field
+  // maps 1:1 to its column and clearing one clears exactly that one (see onSubmit).
+  // A code we don't offer (a pre-INR or hand-edited row) falls back to the default rather
+  // than leaving the select showing nothing.
+  const [currency, setCurrency] = useState(
+    CURRENCIES.find((c) => c.code === item?.currency)?.code ?? DEFAULT_CURRENCY,
+  );
+  const [amount, setAmount] = useState(item?.price_amount != null ? String(item.price_amount) : "");
+  const [priceText, setPriceText] = useState(item?.price_text ?? "");
   const [duration, setDuration] = useState(item?.duration_min != null ? String(item.duration_min) : "");
   const [category, setCategory] = useState(item?.category ?? "");
   const [description, setDescription] = useState(item?.description ?? "");
@@ -689,6 +783,16 @@ function ItemEditor({
     return Number.isInteger(n) && n >= 1 && n <= 600 ? n : "invalid";
   };
 
+  // Empty means "no numeric price"; anything else must be a non-negative finite number
+  // (the backend's ge=0). Validated rather than coerced, so a typo is reported instead
+  // of quietly saving as nothing.
+  const parseAmount = (raw: string): number | null | "invalid" => {
+    const t = raw.trim();
+    if (t === "") return null;
+    const n = Number(t);
+    return Number.isFinite(n) && n >= 0 ? n : "invalid";
+  };
+
   async function onSubmit(e: React.SubmitEvent<HTMLFormElement>) {
     e.preventDefault();
     const trimmed = name.trim();
@@ -698,6 +802,12 @@ function ItemEditor({
       setErr("Duration must be a whole number of minutes between 1 and 600.");
       return;
     }
+    const amt = parseAmount(amount);
+    if (amt === "invalid") {
+      setErr("Amount must be a number — use Display price for ranges and wording.");
+      return;
+    }
+    const text = priceText.trim() || null;
     setBusy("save");
     setErr(null);
     try {
@@ -705,13 +815,14 @@ function ItemEditor({
         // PATCH only what actually changed; an empty diff just closes the editor.
         const patch: Partial<Omit<CatalogItemInput, "kind">> = {};
         if (trimmed !== item.name) patch.name = trimmed;
-        if (price.trim() !== initialPrice.trim()) {
-          // The owner rewrote (or cleared) the price: what they typed is now the
-          // whole truth, so drop the machine-parsed amount/currency alongside.
-          patch.price_text = price.trim() || null;
-          patch.price_amount = null;
-          patch.currency = null;
-        }
+        if (amt !== item.price_amount) patch.price_amount = amt;
+        if (text !== item.price_text) patch.price_text = text;
+        // Currency isn't edited on its own — it's implied by the amount. An amount pins
+        // the selected code (CURRENCIES holds only INR today, the one code the backend
+        // accepts); a row left with neither an amount nor display text has no price at
+        // all, so its currency goes too rather than lingering as a bare "₹".
+        const nextCurrency = amt !== null ? currency : text !== null ? item.currency : null;
+        if (nextCurrency !== item.currency) patch.currency = nextCurrency;
         if (kind === "service" && dur !== item.duration_min) patch.duration_min = dur;
         const cat = category.trim() || null;
         if (cat !== item.category) patch.category = cat;
@@ -724,7 +835,11 @@ function ItemEditor({
         onSaved(await updateCatalogItem(tenantId, item.id, patch), false);
       } else {
         const body: CatalogItemInput = { kind, name: trimmed };
-        if (price.trim()) body.price_text = price.trim();
+        if (amt !== null) {
+          body.price_amount = amt;
+          body.currency = currency;
+        }
+        if (text) body.price_text = text;
         if (kind === "service" && dur !== null) body.duration_min = dur;
         if (category.trim()) body.category = category.trim();
         if (description.trim()) body.description = description.trim();
@@ -776,20 +891,51 @@ function ItemEditor({
             className={fieldCls}
           />
         </Field>
-        <div className={`grid gap-4 ${kind === "service" ? "sm:grid-cols-3" : "sm:grid-cols-2"}`}>
-          <Field
-            label="Price"
-            htmlFor={`${uid}-price`}
-            help="Shown exactly as written, e.g. AED 200-350"
-          >
+        <div className="grid gap-4 sm:grid-cols-2">
+          {/* A real select even though CURRENCIES holds one code: adding a currency has to
+              be a data change, not a UI change. */}
+          <Field label="Currency" htmlFor={`${uid}-currency`}>
+            <Select
+              id={`${uid}-currency`}
+              value={currency}
+              onChange={(e) => setCurrency(e.target.value)}
+              className={`${fieldCls} pr-11`}
+            >
+              {CURRENCIES.map((c) => (
+                <option key={c.code} value={c.code}>
+                  {c.label}
+                </option>
+              ))}
+            </Select>
+          </Field>
+          <Field label="Amount" htmlFor={`${uid}-amount`} help="Numbers only">
             <TextInput
-              id={`${uid}-price`}
-              value={price}
-              onChange={(e) => setPrice(e.target.value)}
-              placeholder="AED 350"
+              id={`${uid}-amount`}
+              type="number"
+              min={0}
+              step="any"
+              inputMode="decimal"
+              value={amount}
+              onChange={(e) => setAmount(e.target.value)}
+              placeholder="350"
               className={fieldCls}
             />
           </Field>
+        </div>
+        <Field
+          label="Display price (optional)"
+          htmlFor={`${uid}-price-text`}
+          help="Overrides the amount — use for ranges like “from ₹40,000”"
+        >
+          <TextInput
+            id={`${uid}-price-text`}
+            value={priceText}
+            onChange={(e) => setPriceText(e.target.value)}
+            placeholder="from ₹40,000"
+            className={fieldCls}
+          />
+        </Field>
+        <div className="grid gap-4 sm:grid-cols-2">
           {kind === "service" && (
             <Field label="Duration (min)" htmlFor={`${uid}-duration`}>
               <TextInput
@@ -815,6 +961,17 @@ function ItemEditor({
             />
           </Field>
         </div>
+        {kind === "product" && (
+          <PhotoField
+            tenantId={tenantId}
+            item={item}
+            storageEnabled={storageEnabled}
+            inputId={`${uid}-photo`}
+            disabled={busy !== null}
+            onPatched={onPatched}
+            onToast={onToast}
+          />
+        )}
         <Field label="Description" htmlFor={`${uid}-desc`}>
           <TextArea
             id={`${uid}-desc`}
@@ -856,6 +1013,173 @@ function ItemEditor({
         </div>
       </form>
     </Card>
+  );
+}
+
+/** The product photo — the one control in the editor that writes outside Save, because
+ *  uploading needs an item id to attach the file to. So it PATCHes the row the moment a
+ *  file is chosen and hands the fresh row up (onPatched) rather than waiting for Save,
+ *  and the add-new-product editor renders it disabled until the row exists. */
+function PhotoField({
+  tenantId,
+  item,
+  storageEnabled,
+  inputId,
+  disabled,
+  onPatched,
+  onToast,
+}: {
+  tenantId: string;
+  item?: CatalogItem;
+  storageEnabled: boolean;
+  inputId: string;
+  /** True while the surrounding form is saving or deleting. */
+  disabled: boolean;
+  onPatched: (item: CatalogItem) => void;
+  onToast: (kind: ToastItem["kind"], text: string) => void;
+}) {
+  const fileRef = useRef<HTMLInputElement>(null);
+  const [busy, setBusy] = useState<"upload" | "remove" | null>(null);
+  const [confirmRemove, setConfirmRemove] = useState(false);
+  const removeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(
+    () => () => {
+      if (removeTimer.current) clearTimeout(removeTimer.current);
+    },
+    [],
+  );
+
+  const photo = item?.image_url ?? null;
+  // Two reasons the picker can't work, each worth saying out loud: there's no row to
+  // attach a file to yet, or the server has no object storage — in which case every
+  // upload answers 503, so it's kinder to say so than to let 5 MB go up and fail.
+  const hint = !item
+    ? "Save the product first, then add a photo"
+    : !storageEnabled
+      ? "Photo uploads aren’t configured on this server"
+      : null;
+  const locked = !item || !storageEnabled || disabled || busy !== null;
+
+  async function onPick(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    // Cleared first, so re-picking the same file after a rejection still fires onChange.
+    e.target.value = "";
+    if (!file || !item || busy) return;
+    // Both limits mirror the backend, so a doomed upload never leaves the browser.
+    if (!IMAGE_TYPES.includes(file.type)) {
+      onToast("error", "Photos must be a PNG, JPEG or WebP image");
+      return;
+    }
+    if (file.size > IMAGE_MAX_MB * 1024 * 1024) {
+      onToast("error", `Photos must be under ${IMAGE_MAX_MB} MB`);
+      return;
+    }
+    setBusy("upload");
+    try {
+      onPatched(await uploadCatalogImage(tenantId, item.id, file));
+      onToast("success", photo ? "Photo replaced" : "Photo added");
+    } catch (err) {
+      onToast("error", errText(err, "Couldn’t upload the photo"));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function onRemove() {
+    if (!item || busy) return;
+    if (!confirmRemove) {
+      setConfirmRemove(true);
+      removeTimer.current = setTimeout(() => setConfirmRemove(false), CONFIRM_MS);
+      return;
+    }
+    if (removeTimer.current) clearTimeout(removeTimer.current);
+    setConfirmRemove(false);
+    setBusy("remove");
+    try {
+      onPatched(await deleteCatalogImage(tenantId, item.id));
+      onToast("success", "Photo removed");
+    } catch (err) {
+      onToast("error", errText(err, "Couldn’t remove the photo"));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  const openPicker = () => fileRef.current?.click();
+  return (
+    <Field label="Photo" htmlFor={inputId} help={hint ?? undefined}>
+      <div className="flex items-center gap-3">
+        {/* The tile is the big target; the button beside it is the same action spelled
+            out. Either opens the picker — same pairing as a card and its pencil. */}
+        <button
+          type="button"
+          onClick={openPicker}
+          disabled={locked}
+          aria-label={photo ? "Replace photo" : "Add photo"}
+          className={`relative grid h-[4.5rem] w-24 shrink-0 place-items-center overflow-hidden rounded-2xl transition-all duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring)] disabled:pointer-events-none disabled:opacity-55 ${
+            photo
+              ? "border border-[var(--color-border)] bg-[var(--color-bg-soft)]"
+              : "border border-dashed border-[var(--color-border-strong)] bg-[var(--color-surface)]/50 text-[var(--color-faint)] hover:border-[var(--color-accent)] hover:bg-[var(--accent-wash)] hover:text-[var(--color-accent-ink)]"
+          }`}
+        >
+          {photo ? (
+            /* Same reason as ItemCard: the photo host is env-dependent at runtime, so
+               next/image would need it pinned into next.config remotePatterns at build
+               time. The button's aria-label names it, so the alt stays empty. */
+            // eslint-disable-next-line @next/next/no-img-element
+            <img src={photo} alt="" className="h-full w-full object-cover" />
+          ) : (
+            <span className="flex flex-col items-center gap-1">
+              <ImageIcon className="h-5 w-5" />
+              <span className="text-[11px] font-semibold">Add photo</span>
+            </span>
+          )}
+          {busy && (
+            <span className="absolute inset-0 grid place-items-center bg-[var(--color-surface)]/75 text-[var(--color-muted)]">
+              <Spinner className="h-4 w-4" />
+            </span>
+          )}
+        </button>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            type="button"
+            variant="secondary"
+            size="sm"
+            onClick={openPicker}
+            disabled={locked}
+            loading={busy === "upload"}
+            icon={<UploadIcon className="h-3.5 w-3.5" />}
+          >
+            {photo ? "Replace" : "Upload"}
+          </Button>
+          {photo && (
+            <Button
+              type="button"
+              variant="danger"
+              size="sm"
+              onClick={onRemove}
+              disabled={disabled || busy === "upload"}
+              loading={busy === "remove"}
+              icon={<TrashIcon className="h-3.5 w-3.5" />}
+            >
+              {confirmRemove ? "Really remove?" : "Remove"}
+            </Button>
+          )}
+        </div>
+      </div>
+      {/* sr-only rather than hidden so the "Photo" label above still opens the picker;
+          the two visible controls are the real affordances, hence tabIndex -1. */}
+      <input
+        ref={fileRef}
+        id={inputId}
+        type="file"
+        accept="image/png,image/jpeg,image/webp"
+        disabled={locked}
+        tabIndex={-1}
+        onChange={onPick}
+        className="sr-only"
+      />
+    </Field>
   );
 }
 
@@ -1161,14 +1485,8 @@ function SnippetEditor({
 }
 
 /* ---- Shared bits -------------------------------------------------------------------- */
-
-function StatusBadge({ status }: { status: "extracted" | "edited" }) {
-  return status === "edited" ? (
-    <Badge tone="success">Edited</Badge>
-  ) : (
-    <Badge tone="accent">Auto</Badge>
-  );
-}
+/* StatusBadge, Field and errText live in ./parts — HoursPanel needs them too, and it
+   can't import the page that renders it. */
 
 function AddTile({
   label,
@@ -1188,30 +1506,5 @@ function AddTile({
       <PlusIcon className="h-4 w-4" />
       {label}
     </button>
-  );
-}
-
-function Field({
-  label,
-  htmlFor,
-  help,
-  children,
-}: {
-  label: string;
-  htmlFor: string;
-  help?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="min-w-0">
-      <label
-        htmlFor={htmlFor}
-        className="mb-1.5 block text-[11px] font-semibold uppercase tracking-wide text-[var(--color-muted)]"
-      >
-        {label}
-      </label>
-      {children}
-      {help && <p className="mt-1 text-[12px] text-[var(--color-faint)]">{help}</p>}
-    </div>
   );
 }

@@ -5,18 +5,18 @@ Each month you receive a service credit plus member pricing on everything else.
 
 ## The plans
 
-### Essential — $115 / month
+### Essential — ₹4,700 / month
 - One 60-minute service each month: **Signature Massage** or **Classic Facial**
 - 10% off all additional services and retail
 - Bring-a-friend guest rate
 
-### Signature — $180 / month
+### Signature — ₹7,400 / month
 - One premium 60–75 minute service each month: **Deep Tissue**, **Hot Stone**,
   **HydraFacial**, or **Anti-Ageing Facial**
 - 15% off all additional services and retail
 - Two guest passes per year (share your monthly service with someone)
 
-### Devotee — $299 / month
+### Devotee — ₹12,200 / month
 - **Two** 60-minute services each month (mix and match massage or facial)
 - 20% off all additional services and retail
 - Four guest passes per year + priority booking on weekends

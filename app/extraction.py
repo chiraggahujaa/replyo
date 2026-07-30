@@ -3,10 +3,12 @@
 RAG makes a persona's documents searchable, but the owner can't see or correct what
 the assistant "knows" — a wrong price in a crawled page is invisible until a customer
 gets quoted it. This module runs a second, structured pass over the SAME embedded
-chunks: an LLM (temperature 0, forced schema) pulls out services, products, guidelines
-and notable facts, which land in relational tables (catalog_items, business_snippets)
-the console can list and edit. app/catalog.py then feeds the curated rows back into
-the agent's prompt as an authoritative block.
+chunks: an LLM (temperature 0, forced schema) pulls out services, products, guidelines,
+notable facts, opening hours and the standard appointment length, which land in
+relational tables (catalog_items, business_snippets, business_profiles) the console can
+list and edit. app/catalog.py then feeds the curated rows back into the agent's prompt
+as an authoritative block, and app/booking.py books on the extracted hours/slot grid —
+so a mistake here is visible and fixable in the console instead of only in a bad reply.
 
 Design choices, and why:
 
@@ -42,8 +44,11 @@ import logging
 from typing import Literal, cast
 
 from langchain_core.messages import HumanMessage, SystemMessage
+from psycopg.types.json import Jsonb
 from pydantic import BaseModel, Field
 
+from app.catalog import HHMM
+from app.currency import DEFAULT_CURRENCY, normalize_currency
 from app.llm import get_chat_model
 from app.rag import collection_name
 from app.tenancy import admin_connection, scoped_connection
@@ -62,6 +67,10 @@ MAX_CONCURRENT_BATCHES = 4
 # (surface the failure in the console).
 STALE_RUN_MINUTES = 15
 
+# Appointment length sanity bounds — a model that reads "open 9 to 5" as a slot length
+# shouldn't be able to produce a 480-minute grid (one slot a day) or a 1-minute one.
+MIN_SLOT_MINUTES, MAX_SLOT_MINUTES = 5, 240
+
 EXTRACTION_PROMPT = """You extract structured business facts from a chunk of a business's \
 documents or website text.
 
@@ -77,11 +86,25 @@ payment terms, dos-and-donts, tone rules).
 location, specialties).
 
 Rules for items:
-- price_text must QUOTE the source verbatim (e.g. "AED 300", "from $50 per session"); null when \
+- price_text must QUOTE the source verbatim (e.g. "₹1,500", "from ₹500 per session"); null when \
 the text states no price.
 - price_amount only when the text states a single unambiguous number for the price; otherwise null.
 - duration_min only when a duration is explicitly stated.
-- Do not list the same service or product twice."""
+- Do not list the same service or product twice.
+
+Rules for opening hours (the `hours` list) — one entry per weekday, and ONLY when the text \
+explicitly states hours. Never guess or infer a weekday the text doesn't mention:
+- weekday is 0=Monday, 1=Tuesday, ... 6=Sunday.
+- Expand stated ranges into one entry per day: "Mon-Sat 9:30am-8pm" becomes six entries \
+(weekday 0,1,2,3,4,5), each open "09:30" and close "20:00".
+- open/close are 24-hour "HH:MM" ("9am" -> "09:00", "8pm" -> "20:00", "noon" -> "12:00").
+- A day the text says is closed gets closed=true with open and close null.
+- Return an empty list when the text states no hours at all.
+
+Rules for slot_minutes:
+- Only set it when the text states a standard appointment/treatment length (e.g. "appointments \
+are 45 minutes", "all consultations are 20 min slots"). It is NOT the duration of one service \
+and NOT the length of the working day. Otherwise null."""
 
 
 # ---------------------------------------------------------------------------
@@ -111,11 +134,29 @@ class ExtractedSnippet(BaseModel):
     body: str = Field(description="The rule or fact itself, as stated in the text.")
 
 
+class ExtractedHours(BaseModel):
+    """Opening hours for ONE weekday, only as explicitly stated by the text.
+
+    `closed` and open/close are mutually exclusive in practice: a stated closure sets
+    closed=true and leaves the times null; a stated window sets both times. An entry
+    that is neither is meaningless and gets dropped in _merge_hours.
+    """
+
+    weekday: int = Field(description="0=Monday, 1=Tuesday, ... 6=Sunday.")
+    closed: bool = Field(False, description="True when the text says the business is closed that day.")
+    open: str | None = Field(None, description='Opening time, 24-hour "HH:MM" (e.g. "09:30").')
+    close: str | None = Field(None, description='Closing time, 24-hour "HH:MM" (e.g. "20:00").')
+
+
 class ExtractionBatch(BaseModel):
     """Everything extracted from one batch of chunks. Empty lists when there's nothing."""
 
     items: list[ExtractedItem] = []
     snippets: list[ExtractedSnippet] = []
+    hours: list[ExtractedHours] = []
+    slot_minutes: int | None = Field(
+        None, description="Standard appointment length in minutes, ONLY if the text states one."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +218,9 @@ def _batches(chunks: list[tuple[str, str | None]]) -> list[list[tuple[str, str |
 # ---------------------------------------------------------------------------
 
 # Optional item fields that count towards "richness" and get coalesced on a merge.
+# `image_url` is deliberately ABSENT, here and in _upsert's column lists: an image is
+# never extracted from text, so extraction must not read, write, or resurrect one. An
+# owner who deletes a product photo has deleted it, and the next run can't bring it back.
 ITEM_FIELDS = ("description", "price_text", "price_amount", "currency", "duration_min", "category")
 
 
@@ -211,6 +255,13 @@ def _merge(
             cand = item.model_dump()
             cand["name"] = item.name.strip()
             cand["source"] = source
+            # Single-currency product: whatever symbol the page used, the amount is
+            # rupees (app/currency.py explains why the funnel is deliberate). An amount
+            # with no stated currency is still rupees — otherwise the catalog block
+            # would render a bare number.
+            cand["currency"] = normalize_currency(cand.get("currency"))
+            if cand["currency"] is None and cand.get("price_amount") is not None:
+                cand["currency"] = DEFAULT_CURRENCY
             prev = items.get(key)
             if prev is None:
                 items[key] = cand
@@ -235,6 +286,50 @@ def _merge(
                 snippets[key] = cand
 
     return list(items.values()), list(snippets.values())
+
+
+def _merge_hours(
+    batches: list[tuple[ExtractionBatch, str | None]],
+) -> tuple[dict[str, dict[str, str] | None] | None, int | None]:
+    """Collapse per-batch hours/slot claims into one week + one appointment length.
+
+    Kept beside `_merge` rather than inside it: hours are a single per-business value,
+    not a list of rows, so they need none of the richness/coalesce machinery — and
+    `_merge`'s signature stays stable for its existing callers and tests.
+
+    Rules, all first-wins because later batches are later PAGES, not better evidence:
+      * the first batch entry that mentions a weekday owns that weekday. An entry that
+        is neither closed nor has both valid times is ignored entirely — it does NOT
+        claim the day, so a good entry in a later batch can still fill it.
+      * a stated closure stores null (the shape's "closed that day").
+      * times must match HHMM exactly; anything else is dropped.
+      * slot_minutes takes the first stated value, clamped to [5, 240].
+
+    Returns (hours-or-None, slot-or-None); None means "nothing stated", which the
+    caller must NOT write over existing data.
+    """
+    hours: dict[str, dict[str, str] | None] = {}
+    slot: int | None = None
+
+    for batch, _source in batches:
+        for entry in batch.hours:
+            if not 0 <= entry.weekday <= 6:
+                continue
+            key = str(entry.weekday)
+            if key in hours:
+                continue
+            if entry.closed:
+                hours[key] = None
+                continue
+            opens = (entry.open or "").strip()
+            closes = (entry.close or "").strip()
+            if not (HHMM.match(opens) and HHMM.match(closes)) or opens >= closes:
+                continue
+            hours[key] = {"open": opens, "close": closes}
+        if slot is None and batch.slot_minutes is not None:
+            slot = max(MIN_SLOT_MINUTES, min(MAX_SLOT_MINUTES, int(batch.slot_minutes)))
+
+    return (hours or None), slot
 
 
 # ---------------------------------------------------------------------------
@@ -387,9 +482,37 @@ async def _upsert(tenant_id: str, items: list[dict], snippets: list[dict]) -> No
             )
 
 
-async def _finish(tenant_id: str, *, error: str | None) -> None:
+async def _finish(
+    tenant_id: str, *, error: str | None,
+    hours: dict[str, dict[str, str] | None] | None = None,
+    slot_minutes: int | None = None,
+) -> None:
+    """Record the run's outcome, and (on success) the extracted hours/settings.
+
+    Two separate statements per column pair, each guarded by its own `…_status =
+    'extracted'`, exactly like catalog_items' upsert: an owner who edited their hours
+    keeps them verbatim no matter what the next run reads off a stale page. `coalesce`
+    is the second half of that shield — a run that found no hours leaves the previous
+    value alone instead of nulling the week. The run-state UPDATE is unconditional and
+    last, so extraction_status/last_extracted_at are written even when both curated
+    writes matched nothing.
+    """
     async with await scoped_connection(tenant_id=tenant_id) as conn:
         if error is None:
+            await conn.execute(
+                """update business_profiles
+                      set hours      = coalesce(%(hours)s, business_profiles.hours),
+                          updated_at = now()
+                    where tenant_id = %(tenant_id)s and hours_status = 'extracted'""",
+                {"tenant_id": tenant_id, "hours": Jsonb(hours) if hours is not None else None},
+            )
+            await conn.execute(
+                """update business_profiles
+                      set slot_minutes = coalesce(%(slot)s, business_profiles.slot_minutes),
+                          updated_at   = now()
+                    where tenant_id = %(tenant_id)s and settings_status = 'extracted'""",
+                {"tenant_id": tenant_id, "slot": slot_minutes},
+            )
             await conn.execute(
                 "update business_profiles set extraction_status = 'done', extraction_error = null, "
                 "last_extracted_at = now(), updated_at = now() where tenant_id = %s",
@@ -430,12 +553,15 @@ async def extract_catalog(tenant_id: str, *, already_marked: bool = False) -> No
             chunks = await _all_chunks(tenant_id)
             sem = asyncio.Semaphore(MAX_CONCURRENT_BATCHES)
             results = await asyncio.gather(*(_run_batch(b, sem) for b in _batches(chunks)))
-            items, snippets = _merge([r for r in results if r is not None])
+            done = [r for r in results if r is not None]
+            items, snippets = _merge(done)
+            hours, slot_minutes = _merge_hours(done)
             await _upsert(tenant_id, items, snippets)
-            await _finish(tenant_id, error=None)
+            await _finish(tenant_id, error=None, hours=hours, slot_minutes=slot_minutes)
             logger.info(
-                "Extracted catalog for tenant %s: %d items, %d snippets from %d chunks",
-                tenant_id, len(items), len(snippets), len(chunks),
+                "Extracted catalog for tenant %s: %d items, %d snippets, hours for %d days, "
+                "slot=%s, from %d chunks",
+                tenant_id, len(items), len(snippets), len(hours or {}), slot_minutes, len(chunks),
             )
         except Exception as exc:
             logger.exception("Catalog extraction failed for tenant %s", tenant_id)

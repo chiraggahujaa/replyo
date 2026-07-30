@@ -28,12 +28,12 @@ create table if not exists catalog_items (
     kind         text not null check (kind in ('service', 'product')),
     name         text not null,
     description  text,
-    price_text   text,     -- verbatim from the source ("AED 300", "from $50") — always safe to display
+    price_text   text,     -- verbatim from the source ("₹1,500", "from ₹500") — always safe to display
     price_amount numeric,  -- only when the source states a single unambiguous number
     currency     text,
     duration_min integer,
     category     text,
-    image_url    text,     -- unused for now; future product images
+    image_url    text,     -- product photo in Supabase Storage (see app/storage.py)
     sort         integer not null default 0,
     source       text,     -- filename / page title the fact came from
     status       text not null default 'extracted' check (status in ('extracted', 'edited')),

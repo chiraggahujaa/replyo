@@ -29,7 +29,8 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.types import interrupt
 from pydantic import BaseModel, Field
 
-from app.booking import clinic_tz, format_slot, parse_requested_time, reserve_slot, try_book
+from app import catalog
+from app.booking import format_slot, parse_requested_time, reserve_slot, tenant_tz, try_book
 from app.calendar import get_calendar
 from app.graph.state import BookingInfo, ConversationState, Intent, LeadInfo
 from app.llm import get_chat_model
@@ -453,8 +454,16 @@ def handle_booking(state: ConversationState, config: RunnableConfig) -> dict:
         extraction_hint="Extract appointment-booking details from the conversation for a business.",
     )
 
-    tz = clinic_tz()
+    # Book on THIS persona's calendar shape, not the deployment default: its timezone
+    # (tenants.timezone) and its curated hours/slot settings (business_profiles, loaded
+    # onto the tenant dict per turn by app/inbound.py). All three fall back to the
+    # app/booking.py constants when the persona has nothing curated yet.
+    tenant = _tenant(config)
+    profile = tenant.get("profile")
+    tz = tenant_tz(tenant)
     now = datetime.now(tz)
+    hours = catalog.hours_from_profile(profile)
+    slot, buffer = catalog.booking_settings(profile)
 
     # Already booked -> reschedule (a concrete new time) or simply acknowledge.
     if booking.get("status") == "confirmed":
@@ -462,7 +471,10 @@ def handle_booking(state: ConversationState, config: RunnableConfig) -> dict:
         if target is None:
             return {"booking_info": booking, "messages": [_confirmed_ack_reply(state, booking, config)]}
         booking["reschedule_from_event_id"] = booking.get("event_id")
-        result = reserve_slot(booking, get_calendar(), target, now=now, tz=tz)
+        result = reserve_slot(
+            booking, get_calendar(), target, now=now, tz=tz,
+            hours=hours, slot=slot, buffer=buffer,
+        )
         if result["status"] == "confirmed":
             ai = _apply_confirmation(state, booking, result, config)
         elif result["status"] == "conflict":
@@ -493,7 +505,9 @@ def handle_booking(state: ConversationState, config: RunnableConfig) -> dict:
         f"Requested time: {booking.get('preferred_time') or 'unspecified'}. "
         f"Latest message: {_latest_user_text(state)}"
     )
-    result = try_book(booking, get_calendar(), time_text)
+    result = try_book(
+        booking, get_calendar(), time_text, tz=tz, hours=hours, slot=slot, buffer=buffer
+    )
 
     if result["status"] == "confirmed":
         ai = _apply_confirmation(state, booking, result, config)
@@ -501,10 +515,13 @@ def handle_booking(state: ConversationState, config: RunnableConfig) -> dict:
         ai = _offer_alternatives(state, booking, result, config)
     else:  # need_time
         booking["status"] = "collecting"
+        # Quote the persona's OWN hours when it has curated any — telling a spa's
+        # customer the dental default would be worse than saying nothing.
+        hours_text = catalog.format_hours_text(hours) or "Mon–Sat 9:30am–8pm, Sun 10am–2pm"
         ai = _reply(
             state,
             "You couldn't work out a concrete appointment time from their message. Politely ask "
-            "them to give a specific day and time within opening hours (Mon–Sat 9:30am–8pm, Sun 10am–2pm).",
+            f"them to give a specific day and time within opening hours ({hours_text}).",
             config=config,
         )
 

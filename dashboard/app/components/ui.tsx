@@ -5,7 +5,7 @@
 
 import Link from "next/link";
 import { useEffect, useRef } from "react";
-import { SparkIcon } from "./icons";
+import { ChevronDownIcon, SparkIcon } from "./icons";
 
 /* ---- Spinner --------------------------------------------------------------------- */
 
@@ -303,7 +303,7 @@ export function Tabs({
 /* ---- Form fields ------------------------------------------------------------------- */
 
 const FIELD_BASE =
-  "w-full rounded-2xl border border-[var(--color-border-strong)] bg-[var(--color-surface)] text-[var(--color-text)] placeholder-[var(--color-faint)] outline-none transition-all duration-200 focus:border-[var(--color-accent)] focus:ring-4 focus:ring-[var(--ring)] focus:glow-accent";
+  "w-full rounded-2xl border border-[var(--color-border-strong)] bg-[var(--color-surface)] text-[var(--color-text)] placeholder-[var(--color-faint)] outline-none transition-all duration-200 focus:border-[var(--color-accent)] focus:ring-4 focus:ring-[var(--ring)] focus:glow-accent disabled:cursor-not-allowed disabled:opacity-50";
 
 export function TextInput({
   className = "",
@@ -321,6 +321,28 @@ export function TextArea({
       className={`${FIELD_BASE} px-4 py-3 text-[14px] leading-relaxed ${className}`}
       {...rest}
     />
+  );
+}
+
+/** Native <select> wearing the TextInput field tokens, so a dropdown never looks like a
+ *  guest on the form. The OS paints the option list — `color-scheme` on the theme root
+ *  is what makes that popup follow light/dark — so all we own is the closed control:
+ *  appearance-none kills the platform arrow and our ChevronDown takes its place. */
+export function Select({
+  className = "",
+  children,
+  ...rest
+}: React.SelectHTMLAttributes<HTMLSelectElement>) {
+  return (
+    <div className="relative">
+      <select
+        className={`${FIELD_BASE} cursor-pointer appearance-none px-4 py-3 pr-11 text-[14.5px] ${className}`}
+        {...rest}
+      >
+        {children}
+      </select>
+      <ChevronDownIcon className="pointer-events-none absolute right-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-[var(--color-faint)]" />
+    </div>
   );
 }
 
