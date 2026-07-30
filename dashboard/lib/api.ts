@@ -177,25 +177,37 @@ export type CatalogSnippet = {
 /** Opening hours keyed "0" (Monday) … "6" (Sunday). A null (or absent) day is closed. */
 export type BusinessHours = Record<string, { open: string; close: string } | null>;
 
-/** Opening hours + the appointment grid the assistant offers slots from. Extracted from
- *  knowledge, then editable; each half tracks its own extracted/edited status.
+/** The contact fields the backend knows (app/catalog.py CONTACT_FIELDS) — anything else is
+ *  a 422. An absent key means "not stated"; `{}` is a real value, meaning the owner
+ *  publishes no contact details at all. */
+export type ContactField = "phone" | "whatsapp" | "email" | "address" | "website" | "maps_url";
+export type BusinessContact = Partial<Record<ContactField, string>>;
+
+/** Opening hours, the appointment grid the assistant offers slots from, and the contact
+ *  card. All extracted from knowledge, then editable; each card tracks its own
+ *  extracted/edited status.
  *
- *  Only `hours` is nullable: a persona with no business_profiles row yet still reports the
- *  column defaults (30 / 0 / "extracted"), so the console renders one state, not two. */
+ *  Only `hours` and `contact` are nullable: a persona with no business_profiles row yet
+ *  still reports the column defaults (30 / 0 / "extracted"), so the console renders one
+ *  state, not two. */
 export type CatalogSettings = {
   hours: BusinessHours | null;
   slot_minutes: number;
   buffer_minutes: number;
   hours_status: "extracted" | "edited";
   settings_status: "extracted" | "edited";
+  contact: BusinessContact | null;
+  contact_status: "extracted" | "edited";
 };
 
-/** PATCH sends any subset; whatever is sent flips that half's status to "edited" — so the
- *  two sections must save separately, or fixing Tuesday would also claim the slot grid. */
+/** PATCH sends any subset; whatever is sent flips that card's status to "edited" — so the
+ *  three cards must save separately, or fixing Tuesday would also claim the slot grid and
+ *  the phone number. `hours: null` / `contact: null` hand that card back to extraction. */
 export type CatalogSettingsInput = {
   hours?: BusinessHours | null;
   slot_minutes?: number;
   buffer_minutes?: number;
+  contact?: BusinessContact | null;
 };
 
 /** Catalog metadata — deliberately row-free. Rows come a page at a time from
@@ -332,7 +344,7 @@ export const deleteCatalogImage = (tenantId: string, itemId: string) =>
     tenantId,
   });
 
-// ---- catalog settings (opening hours + appointment grid) ----
+// ---- catalog settings (opening hours + appointment grid + contact card) ----
 
 export const updateCatalogSettings = (tenantId: string, body: CatalogSettingsInput) =>
   req<CatalogSettings>("/api/personas/active/catalog/settings", {

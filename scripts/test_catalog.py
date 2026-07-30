@@ -1,17 +1,31 @@
 """Deterministic tests for the business-catalog pipeline's pure pieces.
 
-Covers `_merge` (dedupe + coalesce rules in app/extraction.py), the prompt-block
-builders in app/catalog.py, the admin API request-model validation, and the keyset
-cursor/limit helpers behind GET /api/personas/active/catalog/entries. All pure —
-no network, no database, no LLM.
+Covers `_merge` and `_merge_contact` (dedupe/coalesce and first-wins rules in
+app/extraction.py), the contact validators and prompt-block builders in app/catalog.py,
+the admin API request-model validation, and the keyset cursor/limit helpers behind
+GET /api/personas/active/catalog/entries. All pure — no network, no database, no LLM.
 
 Run:  uv run python scripts/test_catalog.py
 """
 
 from __future__ import annotations
 
-from app.catalog import build_catalog_block, build_guidelines_block
-from app.extraction import ExtractedItem, ExtractedSnippet, ExtractionBatch, _merge
+from app.catalog import (
+    CONTACT_FIELDS,
+    build_catalog_block,
+    build_guidelines_block,
+    clean_contact,
+    contact_from_profile,
+    contact_lines,
+)
+from app.extraction import (
+    ExtractedContact,
+    ExtractedItem,
+    ExtractedSnippet,
+    ExtractionBatch,
+    _merge,
+    _merge_contact,
+)
 
 FAILURES = []
 
@@ -151,10 +165,116 @@ def test_guidelines_block():
     check("whole block capped at 2000 chars", len(block) <= 2000, str(len(block)))
 
 
+def test_contact():
+    print("\n\033[1m5) contact details — cleaning, merging, rendering\033[0m")
+
+    # --- clean_contact_value's per-field rules, via clean_contact ------------------
+    cleaned = clean_contact({
+        "phone": "  +91 98765   43210 ",
+        "email": "Hello@Example.com",
+        "address": "12 MG Road\nBengaluru 560001",
+        "website": "brightsmile.in",
+        "maps_url": "https://maps.app.goo.gl/AbCdEf",
+    })
+    check("whitespace collapsed to one line (phone)", cleaned["phone"] == "+91 98765 43210",
+          repr(cleaned.get("phone")))
+    check("a multi-line address becomes one line",
+          cleaned["address"] == "12 MG Road Bengaluru 560001", repr(cleaned.get("address")))
+    check("email kept verbatim (case included)", cleaned["email"] == "Hello@Example.com")
+    check("scheme-less domain accepted", cleaned["website"] == "brightsmile.in")
+    check("map link accepted", cleaned["maps_url"].endswith("AbCdEf"))
+
+    for label, raw in (
+        ("phone with no digits", {"phone": "call the front desk"}),
+        ("phone with too few digits", {"phone": "ext. 12"}),
+        ("email with no @", {"email": "hello.example.com"}),
+        ("email with no dotted domain", {"email": "hello@example"}),
+        ("website that's prose", {"website": "see our site for details"}),
+        ("blank value", {"phone": "   "}),
+        ("wrong type", {"phone": 9876543210}),
+    ):
+        check(f"unusable ({label}) is dropped", clean_contact(raw) == {}, str(clean_contact(raw)))
+
+    check("unknown keys are dropped",
+          clean_contact({"fax": "123456", "instagram": "@x"}) == {})
+    check("non-dict input -> {}", clean_contact("+91 98765 43210") == {} and clean_contact(None) == {})
+    check("value capped at 200 chars",
+          len(clean_contact({"address": "a" * 500})["address"]) == 200,
+          str(len(clean_contact({"address": "a" * 500})["address"])))
+
+    # Field order is CONTACT_FIELDS order regardless of the order keys arrived in — the
+    # stored jsonb has to read the way the card displays.
+    reordered = clean_contact({
+        "maps_url": "https://maps.app.goo.gl/x", "email": "a@b.co", "phone": "011-4123 4567",
+    })
+    check("keys come back in CONTACT_FIELDS order",
+          list(reordered) == [f for f in CONTACT_FIELDS if f in reordered]
+          and list(reordered) == ["phone", "email", "maps_url"], str(list(reordered)))
+
+    check("profile with no contact -> {}", contact_from_profile({"hours": None}) == {})
+    check("no profile at all -> {}", contact_from_profile(None) == {})
+    check("profile contact is re-validated on the way out",
+          contact_from_profile({"contact": {"phone": "nope", "email": "a@b.co"}})
+          == {"email": "a@b.co"})
+
+    # --- _merge_contact: first valid value per field wins --------------------------
+    def merged(*contacts):
+        return _merge_contact([
+            (ExtractionBatch(contact=ExtractedContact(**c) if c is not None else None), None)
+            for c in contacts
+        ])
+
+    check("nothing stated -> None", merged(None, None) is None, str(merged(None, None)))
+    check("no batches at all -> None", _merge_contact([]) is None)
+
+    got = merged({"phone": "011-4123 4567"}, {"phone": "022-9999 0000"})
+    check("first batch owns the field it claimed", got == {"phone": "011-4123 4567"}, str(got))
+
+    got = merged({"phone": "011-4123 4567"}, {"address": "12 MG Road", "email": "a@b.co"})
+    check("fields from different batches add up",
+          got == {"phone": "011-4123 4567", "email": "a@b.co", "address": "12 MG Road"}, str(got))
+
+    # An invalid claim must not CLAIM the field — a good value later still fills it.
+    got = merged({"phone": "call us"}, {"phone": "011-4123 4567"})
+    check("an invalid claim leaves the field unclaimed", got == {"phone": "011-4123 4567"}, str(got))
+
+    got = merged({"email": "not-an-email"}, None)
+    check("only-invalid claims -> None (nothing to write)", got is None, str(got))
+
+    # --- contact_lines + the block section ----------------------------------------
+    check("no contact -> no lines", contact_lines({}) == [] and contact_lines(None) == [])
+    lines = contact_lines({"phone": "011-4123 4567", "address": "12 MG Road"})
+    check("section header first", lines[0] == "Contact details:", str(lines[:1]))
+    check("labelled bullets, in field order",
+          lines[1:] == ["- Phone: 011-4123 4567", "- Address: 12 MG Road"], str(lines[1:]))
+
+    block = build_catalog_block(
+        [{"kind": "service", "name": "Cleaning", "price_text": "₹1,500"}],
+        [{"title": "Location", "body": "Central."}],
+        hours_text="Mon–Fri 9am–6pm",
+        contact={"phone": "011-4123 4567", "website": "brightsmile.in"},
+    )
+    assert block is not None
+    check("contact section renders in the catalog block", "- Phone: 011-4123 4567" in block, block)
+    check("contact sits between hours and key facts",
+          block.index("Opening hours:") < block.index("Contact details:") < block.index("Key facts:"),
+          block)
+    check("contact-only catalog still renders a block",
+          build_catalog_block([], [], contact={"phone": "011-4123 4567"}) is not None)
+    check("no contact -> no contact section",
+          "Contact details:" not in (build_catalog_block(
+              [{"kind": "service", "name": "Cleaning"}], []) or ""))
+
+
 def test_request_models():
-    print("\n\033[1m5) admin API request models\033[0m")
+    print("\n\033[1m6) admin API request models\033[0m")
     try:
-        from app.admin_api import CreateCatalogItem, CreateSnippet, UpdateCatalogItem
+        from app.admin_api import (
+            CreateCatalogItem,
+            CreateSnippet,
+            UpdateBusinessSettings,
+            UpdateCatalogItem,
+        )
     except Exception as exc:  # pragma: no cover — env-dependent import, not a failure here
         print(f"   SKIP admin_api not importable in this environment ({exc})")
         return
@@ -188,9 +308,35 @@ def test_request_models():
     check("overlong snippet body rejected",
           rejects(lambda: CreateSnippet(kind="guideline", title="T", body="b" * 5001)))
 
+    # --- the contact card: an owner's bad value is a 422, not a silent drop ---------
+    check("valid contact accepted and normalized",
+          UpdateBusinessSettings(contact={"phone": " 011-4123  4567 "}).contact
+          == {"phone": "011-4123 4567"},
+          str(UpdateBusinessSettings(contact={"phone": " 011-4123  4567 "}).contact))
+    check("blank field is dropped, not rejected (that's how one is cleared)",
+          UpdateBusinessSettings(contact={"phone": "   ", "email": "a@b.co"}).contact
+          == {"email": "a@b.co"})
+    check("empty card accepted (owner publishes no details)",
+          UpdateBusinessSettings(contact={}).contact == {})
+    check("contact: null accepted (hand the card back to extraction)",
+          UpdateBusinessSettings(contact=None).model_dump(exclude_unset=True) == {"contact": None})
+    check("unknown contact field rejected",
+          rejects(lambda: UpdateBusinessSettings(contact={"fax": "011-4123 4567"})))
+    check("bad email rejected", rejects(lambda: UpdateBusinessSettings(contact={"email": "nope"})))
+    check("digitless phone rejected",
+          rejects(lambda: UpdateBusinessSettings(contact={"phone": "call us"})))
+    check("overlong value rejected",
+          rejects(lambda: UpdateBusinessSettings(contact={"address": "a" * 201})))
+    check("contact keys stored in display order",
+          list(UpdateBusinessSettings(
+              contact={"website": "x.co", "phone": "011-4123 4567"}).contact or {})
+          == ["phone", "website"])
+    check("hours-only patch leaves contact unset (so it isn't claimed)",
+          "contact" not in UpdateBusinessSettings(slot_minutes=45).model_dump(exclude_unset=True))
+
 
 def test_pagination_cursors():
-    print("\n\033[1m6) catalog entries — cursor + limit helpers\033[0m")
+    print("\n\033[1m7) catalog entries — cursor + limit helpers\033[0m")
     try:
         from app.admin_api import (
             ENTRIES_LIMIT_DEFAULT,
@@ -264,7 +410,7 @@ def test_pagination_cursors():
 
 
 def test_entries_route_shape():
-    print("\n\033[1m7) catalog entries — keyset wiring (table map + sort/filter agreement)\033[0m")
+    print("\n\033[1m8) catalog entries — keyset wiring (table map + sort/filter agreement)\033[0m")
     try:
         from app.admin_api import _ENTRY_TABLE_FOR_KIND, _ENTRY_TABLES, get_catalog_entries
     except Exception as exc:  # pragma: no cover — env-dependent import
@@ -296,7 +442,7 @@ def test_entries_route_shape():
 
 
 def test_entries_page_assembly():
-    print("\n\033[1m8) catalog entries — page assembly (limit+1 -> entries, next_cursor)\033[0m")
+    print("\n\033[1m9) catalog entries — page assembly (limit+1 -> entries, next_cursor)\033[0m")
     try:
         from app.admin_api import _ENTRY_TABLES, _entries_page, decode_cursor
     except Exception as exc:  # pragma: no cover — env-dependent import
@@ -365,6 +511,7 @@ def main():
     test_merge_snippets()
     test_catalog_block()
     test_guidelines_block()
+    test_contact()
     test_request_models()
     test_pagination_cursors()
     test_entries_route_shape()

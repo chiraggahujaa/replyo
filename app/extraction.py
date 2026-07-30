@@ -4,8 +4,9 @@ RAG makes a persona's documents searchable, but the owner can't see or correct w
 the assistant "knows" — a wrong price in a crawled page is invisible until a customer
 gets quoted it. This module runs a second, structured pass over the SAME embedded
 chunks: an LLM (temperature 0, forced schema) pulls out services, products, guidelines,
-notable facts, opening hours and the standard appointment length, which land in
-relational tables (catalog_items, business_snippets, business_profiles) the console can
+notable facts, opening hours, the standard appointment length and the business's contact
+details, which land in relational tables (catalog_items, business_snippets,
+business_profiles) the console can
 list and edit. app/catalog.py then feeds the curated rows back into the agent's prompt
 as an authoritative block, and app/booking.py books on the extracted hours/slot grid —
 so a mistake here is visible and fixable in the console instead of only in a bad reply.
@@ -47,7 +48,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from psycopg.types.json import Jsonb
 from pydantic import BaseModel, Field
 
-from app.catalog import HHMM
+from app.catalog import CONTACT_FIELDS, HHMM, clean_contact_value
 from app.currency import DEFAULT_CURRENCY, normalize_currency
 from app.llm import get_chat_model
 from app.rag import collection_name
@@ -117,7 +118,19 @@ explicitly states hours. Never guess or infer a weekday the text doesn't mention
 Rules for slot_minutes:
 - Only set it when the text states a standard appointment/treatment length (e.g. "appointments \
 are 45 minutes", "all consultations are 20 min slots"). It is NOT the duration of one service \
-and NOT the length of the working day. Otherwise null."""
+and NOT the length of the working day. Otherwise null.
+
+Rules for contact details (the `contact` object) — copy each one VERBATIM from the text, and \
+leave a field null whenever the text doesn't state it. Never assemble a number, address or \
+domain out of fragments, and never guess a website from the business name:
+- phone: the business's own phone number, exactly as written.
+- whatsapp: only a number the text specifically calls a WhatsApp number.
+- email: a single email address belonging to the business.
+- address: its street address on ONE line.
+- website: the business's own website address.
+- maps_url: a link to its map or directions listing (e.g. Google Maps).
+- Contact details for someone else (a supplier, an insurer, a lab) are NOT the business's — \
+leave those fields null."""
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +183,25 @@ class ExtractedHours(BaseModel):
     close: str | None = Field(None, description='Closing time, 24-hour "HH:MM" (e.g. "20:00").')
 
 
+class ExtractedContact(BaseModel):
+    """How customers reach the business — every field only as the text explicitly states it.
+
+    One flat object rather than a list of (field, value) pairs: the field set is small,
+    fixed and singular (a business has one address, not an unknown number of them), so a
+    named slot per field is the shape that makes "the text doesn't say" expressible as
+    null instead of as an omission we'd have to guess at.
+    """
+
+    phone: str | None = Field(None, description="The business's phone number, as written.")
+    whatsapp: str | None = Field(
+        None, description="A number the text specifically calls a WhatsApp number."
+    )
+    email: str | None = Field(None, description="A single email address for the business.")
+    address: str | None = Field(None, description="Its street address, on one line.")
+    website: str | None = Field(None, description="The business's own website address.")
+    maps_url: str | None = Field(None, description="A link to its map/directions listing.")
+
+
 class ExtractionBatch(BaseModel):
     """Everything extracted from one batch of chunks. Empty lists when there's nothing."""
 
@@ -178,6 +210,9 @@ class ExtractionBatch(BaseModel):
     hours: list[ExtractedHours] = []
     slot_minutes: int | None = Field(
         None, description="Standard appointment length in minutes, ONLY if the text states one."
+    )
+    contact: ExtractedContact | None = Field(
+        None, description="Contact details, ONLY those the text states. Null when it states none."
     )
 
 
@@ -354,6 +389,40 @@ def _merge_hours(
     return (hours or None), slot
 
 
+def _merge_contact(
+    batches: list[tuple[ExtractionBatch, str | None]],
+) -> dict[str, str] | None:
+    """Collapse per-batch contact claims into one card: first valid value per field wins.
+
+    Same first-wins reasoning as `_merge_hours` — later batches are later PAGES, not better
+    evidence, and the pages a crawler reaches first (home, contact) are the ones that carry
+    the real number. Per FIELD rather than per object, because a business's phone and its
+    address routinely live on different pages: half a card from one and half from another
+    add up to the whole thing.
+
+    Every value goes through app/catalog.py's `clean_contact_value`, so an invalid claim
+    (a "phone number" with no digits, an address-shaped email) is dropped WITHOUT claiming
+    its field — a good value in a later batch can still fill it.
+
+    Returns None when nothing was stated, which the caller must NOT write over existing
+    data; `{}` is impossible by construction (an empty dict returns as None).
+    """
+    contact: dict[str, str] = {}
+    for batch, _source in batches:
+        if batch.contact is None:
+            continue
+        claimed = batch.contact.model_dump()
+        for field in CONTACT_FIELDS:
+            if field in contact:
+                continue
+            value = clean_contact_value(field, claimed.get(field))
+            if value:
+                contact[field] = value
+    # Rebuilt in CONTACT_FIELDS order so the log line and the tests read predictably;
+    # Postgres normalizes jsonb key order anyway, and rendering walks CONTACT_FIELDS.
+    return {f: contact[f] for f in CONTACT_FIELDS if f in contact} or None
+
+
 # ---------------------------------------------------------------------------
 # The run itself
 # ---------------------------------------------------------------------------
@@ -508,16 +577,17 @@ async def _finish(
     tenant_id: str, *, error: str | None,
     hours: dict[str, dict[str, str] | None] | None = None,
     slot_minutes: int | None = None,
+    contact: dict[str, str] | None = None,
 ) -> None:
-    """Record the run's outcome, and (on success) the extracted hours/settings.
+    """Record the run's outcome, and (on success) the extracted hours/settings/contact.
 
-    Two separate statements per column pair, each guarded by its own `…_status =
-    'extracted'`, exactly like catalog_items' upsert: an owner who edited their hours
-    keeps them verbatim no matter what the next run reads off a stale page. `coalesce`
-    is the second half of that shield — a run that found no hours leaves the previous
-    value alone instead of nulling the week. The run-state UPDATE is unconditional and
-    last, so extraction_status/last_extracted_at are written even when both curated
-    writes matched nothing.
+    One statement per curated column, each guarded by its own `…_status = 'extracted'`,
+    exactly like catalog_items' upsert: an owner who edited their hours (or their phone
+    number) keeps them verbatim no matter what the next run reads off a stale page.
+    `coalesce` is the second half of that shield — a run that found no hours leaves the
+    previous value alone instead of nulling the week. The run-state UPDATE is unconditional
+    and last, so extraction_status/last_extracted_at are written even when every curated
+    write matched nothing.
     """
     async with await scoped_connection(tenant_id=tenant_id) as conn:
         if error is None:
@@ -534,6 +604,16 @@ async def _finish(
                           updated_at   = now()
                     where tenant_id = %(tenant_id)s and settings_status = 'extracted'""",
                 {"tenant_id": tenant_id, "slot": slot_minutes},
+            )
+            await conn.execute(
+                """update business_profiles
+                      set contact    = coalesce(%(contact)s, business_profiles.contact),
+                          updated_at = now()
+                    where tenant_id = %(tenant_id)s and contact_status = 'extracted'""",
+                {
+                    "tenant_id": tenant_id,
+                    "contact": Jsonb(contact) if contact is not None else None,
+                },
             )
             await conn.execute(
                 "update business_profiles set extraction_status = 'done', extraction_error = null, "
@@ -578,12 +658,16 @@ async def extract_catalog(tenant_id: str, *, already_marked: bool = False) -> No
             done = [r for r in results if r is not None]
             items, snippets = _merge(done)
             hours, slot_minutes = _merge_hours(done)
+            contact = _merge_contact(done)
             await _upsert(tenant_id, items, snippets)
-            await _finish(tenant_id, error=None, hours=hours, slot_minutes=slot_minutes)
+            await _finish(
+                tenant_id, error=None, hours=hours, slot_minutes=slot_minutes, contact=contact
+            )
             logger.info(
                 "Extracted catalog for tenant %s: %d items, %d snippets, hours for %d days, "
-                "slot=%s, from %d chunks",
-                tenant_id, len(items), len(snippets), len(hours or {}), slot_minutes, len(chunks),
+                "slot=%s, contact fields %s, from %d chunks",
+                tenant_id, len(items), len(snippets), len(hours or {}), slot_minutes,
+                sorted(contact or {}), len(chunks),
             )
         except Exception as exc:
             logger.exception("Catalog extraction failed for tenant %s", tenant_id)

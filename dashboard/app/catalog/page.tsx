@@ -1,8 +1,9 @@
 "use client";
 
 // Catalog — the structured view of what extraction pulled out of a persona's knowledge:
-// services and products (with pricing), customer-handling guidelines, and notable
-// business facts. Everything is editable inline; any human write flips a row's status
+// services and products (with pricing), customer-handling guidelines, notable business
+// facts, opening hours and contact details. Everything is editable; any human write flips
+// the row's (or the profile card's) status
 // to "edited" server-side, so the Auto/Edited badges always tell the owner what came
 // from the machine and what they've already vetted. While an extraction runs we poll
 // every 3s (extraction is a background job with no push channel of its own) and stop
@@ -72,6 +73,7 @@ import {
   UploadIcon,
   WandIcon,
 } from "../components/icons";
+import { ContactPanel } from "./ContactPanel";
 import { HoursPanel } from "./HoursPanel";
 import { Field, StatusBadge, errText } from "./parts";
 
@@ -85,9 +87,15 @@ const CONFIRM_MS = 3200;
 const PAGE_SIZE = 15;
 
 /** The four tabs backed by catalog rows (`EntryKind`, from lib/api — the same union the
- *  counts payload and the entries endpoint are keyed by). "hours" is the fifth tab — a
- *  settings editor, not a list, so it has no add label, plural or count. */
-type TabKey = EntryKind | "hours";
+ *  counts payload and the entries endpoint are keyed by). "hours" and "contact" are the
+ *  other two — profile editors, not lists, so they have no add label, plural or count. */
+type TabKey = EntryKind | "hours" | "contact";
+
+/** The tabs that edit the business profile rather than list rows. One place to ask, so the
+ *  row-fetching machinery below stays off on every one of them. */
+const PROFILE_TABS = ["hours", "contact"] as const;
+const isProfileTab = (tab: TabKey): tab is (typeof PROFILE_TABS)[number] =>
+  (PROFILE_TABS as readonly string[]).includes(tab);
 
 const TAB_META: Record<EntryKind, { label: string; add: string; plural: string }> = {
   service: { label: "Services", add: "Add service", plural: "services" },
@@ -407,10 +415,11 @@ function Catalog({ tenantId, personaName }: { tenantId: string; personaName: str
     };
   }, [tenantId, applyData]);
 
-  // The active list tab and its cache. `null` on the Hours tab, which is a settings editor
-  // with no rows — so nothing below it ever fetches. Reading `.loading` / `.loaded` /
-  // `.error` / `.cursor` off the union is fine; only `.rows` needs the narrowed branch.
-  const active: EntryKind | null = tab === "hours" ? null : tab;
+  // The active list tab and its cache. `null` on the profile tabs (Hours, Contact), which
+  // are editors with no rows — so nothing below them ever fetches. Reading `.loading` /
+  // `.loaded` / `.error` / `.cursor` off the union is fine; only `.rows` needs the narrowed
+  // branch.
+  const active: EntryKind | null = isProfileTab(tab) ? null : tab;
   const activeCache: PageCache<CatalogItem> | PageCache<CatalogSnippet> | null =
     active === null
       ? null
@@ -640,8 +649,9 @@ function Catalog({ tenantId, personaName }: { tenantId: string; personaName: str
       label: TAB_META[k].label,
       count: counts?.[k],
     })),
-    // No count: hours isn't a list, and "7" would read as seven of something.
+    // No counts: neither is a list, and a number here would read as N of something.
     { key: "hours", label: "Hours & booking" },
+    { key: "contact", label: "Contact" },
   ];
 
   const extraction = data?.extraction;
@@ -754,18 +764,27 @@ function Catalog({ tenantId, personaName }: { tenantId: string; personaName: str
               }
             />
           </Card>
-        ) : tab === "hours" ? (
+        ) : isProfileTab(tab) ? (
           loading ? (
             <div className="space-y-6" aria-busy>
               <SkeletonCard />
-              <SkeletonCard />
+              {/* Hours is two cards (hours + appointment grid); Contact is one. */}
+              {tab === "hours" && <SkeletonCard />}
             </div>
-          ) : (
-            // Keyed on the last extraction: a run that finishes while this panel is open
-            // has written new hours, so re-seed the form from them. Ordinary polls (and
-            // our own saves, which reconcile in place) leave the key alone, so nothing
-            // yanks the form out from under someone mid-edit.
+          ) : /* Both panels are keyed on the last extraction: a run that finishes while one
+                 is open has written new hours or contact details, so re-seed the form from
+                 them. Ordinary polls (and our own saves, which reconcile in place) leave the
+                 key alone, so nothing yanks a form out from under someone mid-edit. */
+          tab === "hours" ? (
             <HoursPanel
+              key={extraction?.last_extracted_at ?? "never"}
+              tenantId={tenantId}
+              settings={data?.settings ?? null}
+              onSaved={handleSettingsSaved}
+              onToast={pushToast}
+            />
+          ) : (
+            <ContactPanel
               key={extraction?.last_extracted_at ?? "never"}
               tenantId={tenantId}
               settings={data?.settings ?? null}

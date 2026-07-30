@@ -23,7 +23,13 @@ from psycopg.types.json import Jsonb
 from pydantic import BaseModel, Field, field_validator
 
 from app import extraction, storage
-from app.catalog import HHMM
+from app.catalog import (
+    CONTACT_FIELDS,
+    HHMM,
+    MAX_CONTACT_VALUE_CHARS,
+    MIN_PHONE_DIGITS,
+    clean_contact_value,
+)
 from app.config import settings
 from app.currency import CURRENCY_CODES
 from app.knowledge import ingest_upload, ingest_website
@@ -137,19 +143,35 @@ class UpdateCatalogItem(BaseModel):
     _currency_supported = field_validator("currency")(_valid_currency)
 
 
-class UpdateBusinessSettings(BaseModel):
-    """PATCH body for the opening hours + appointment settings (business_profiles).
+# Why a given contact value was rejected, in the owner's terms. Keyed by field so the 422
+# says what to fix rather than "invalid contact" — the rules themselves live in
+# app/catalog.py clean_contact_value, and these sentences are its error messages.
+CONTACT_HINTS = {
+    "phone": f"phone: needs at least {MIN_PHONE_DIGITS} digits to be a dialable number",
+    "whatsapp": f"whatsapp: needs at least {MIN_PHONE_DIGITS} digits to be a dialable number",
+    "email": "email: must look like an address, e.g. hello@example.com",
+    "address": "address: must not be blank",
+    "website": "website: must look like example.com or https://example.com",
+    "maps_url": "maps_url: must look like a link, e.g. https://maps.app.goo.gl/…",
+}
 
-    Any subset; an omitted field is left untouched. Editing `hours` flips
-    hours_status to 'edited' and editing slot/buffer flips settings_status, which is what
-    stops the next extraction run from overwriting the owner's word (see app/extraction.py
-    _finish). `hours` uses the stored shape — weekday index as a STRING key, null for a
-    closed day — validated here so nothing malformed can reach the jsonb column.
+
+class UpdateBusinessSettings(BaseModel):
+    """PATCH body for the opening hours, appointment settings and contact details.
+
+    All three live on business_profiles and all three take any subset; an omitted field is
+    left untouched. Editing `hours` flips hours_status to 'edited', slot/buffer flips
+    settings_status, and `contact` flips contact_status — one flag per card, which is what
+    stops the next extraction run from overwriting whichever half the owner has claimed
+    (see app/extraction.py _finish). `hours` uses the stored shape — weekday index as a
+    STRING key, null for a closed day — validated here so nothing malformed can reach the
+    jsonb column.
     """
 
     hours: dict[str, dict[str, str] | None] | None = None
     slot_minutes: int | None = Field(None, ge=5, le=240)
     buffer_minutes: int | None = Field(None, ge=0, le=120)
+    contact: dict[str, str | None] | None = None
 
     @field_validator("hours")
     @classmethod
@@ -170,6 +192,37 @@ class UpdateBusinessSettings(BaseModel):
                 raise ValueError(f"day {key}: close must be later than open")
             cleaned[key] = {"open": opens, "close": closes}
         return cleaned
+
+    @field_validator("contact")
+    @classmethod
+    def _valid_contact(cls, value: dict | None) -> dict | None:
+        """The contact card, validated field by field against app/catalog.py's rules.
+
+        A blank or null value CLEARS that field rather than failing: the console's card
+        posts every input it has, and emptying one is how an owner removes a detail. A
+        value that is present but doesn't pass its field's rule is a 422 naming the field —
+        the machine's bad claims are dropped silently (see _merge_contact), but an owner
+        typing an email with no @ deserves to be told rather than to watch it vanish.
+        """
+        if value is None:
+            return None
+        cleaned: dict[str, str] = {}
+        for key, raw in value.items():
+            if key not in CONTACT_FIELDS:
+                raise ValueError(
+                    f"unknown contact field {key!r}; allowed: {', '.join(CONTACT_FIELDS)}"
+                )
+            if raw is None or not raw.strip():
+                continue  # not set — the way a field is cleared
+            if len(raw) > MAX_CONTACT_VALUE_CHARS:
+                raise ValueError(f"{key}: must be at most {MAX_CONTACT_VALUE_CHARS} characters")
+            usable = clean_contact_value(key, raw)
+            if usable is None:
+                raise ValueError(CONTACT_HINTS[key])
+            cleaned[key] = usable
+        # CONTACT_FIELDS order, so a validated body reads predictably; Postgres normalizes
+        # jsonb key order on write, and every renderer walks CONTACT_FIELDS itself.
+        return {f: cleaned[f] for f in CONTACT_FIELDS if f in cleaned}
 
 
 class CreateSnippet(BaseModel):
@@ -548,14 +601,16 @@ async def get_catalog(tenant: dict = Depends(_require_tenant)) -> dict:
             "error": profile["extraction_error"] if profile else None,
             "last_extracted_at": profile["last_extracted_at"] if profile else None,
         },
-        # Opening hours + appointment settings. A persona with no profile row yet reports
-        # the column defaults, so the console renders one state, not two.
+        # Opening hours, appointment settings and contact details. A persona with no profile
+        # row yet reports the column defaults, so the console renders one state, not two.
         "settings": {
             "hours": (profile or {}).get("hours"),
             "slot_minutes": (profile or {}).get("slot_minutes") or 30,
             "buffer_minutes": (profile or {}).get("buffer_minutes") or 0,
             "hours_status": (profile or {}).get("hours_status") or "extracted",
             "settings_status": (profile or {}).get("settings_status") or "extracted",
+            "contact": (profile or {}).get("contact"),
+            "contact_status": (profile or {}).get("contact_status") or "extracted",
         },
         # Whether the image endpoints below will work at all, so the console can disable
         # the picker with an explanation instead of showing a 503 after a 5 MB upload.
@@ -625,19 +680,22 @@ async def get_catalog_entries(
 async def update_business_settings(
     body: UpdateBusinessSettings, tenant: dict = Depends(_require_tenant)
 ) -> dict:
-    """Edit the opening hours / appointment settings; the edited half becomes the owner's word.
+    """Edit the hours / appointment settings / contact card; each edit becomes the owner's word.
 
-    Two status flags, flipped independently: touching `hours` sets hours_status='edited',
-    touching slot/buffer sets settings_status='edited'. From then on extraction refreshes
-    only the half the owner hasn't claimed (app/extraction.py _finish). The row is
-    upserted because a persona that has never run an extraction has no profile row yet —
-    editing hours must not require extracting first.
+    Three status flags, flipped independently: touching `hours` sets hours_status='edited',
+    slot/buffer sets settings_status='edited', and `contact` sets contact_status='edited'.
+    From then on extraction refreshes only the cards the owner hasn't claimed
+    (app/extraction.py _finish). The row is upserted because a persona that has never run an
+    extraction has no profile row yet — editing hours or a phone number must not require
+    extracting first.
 
-    `hours: null` is the way BACK: it clears the owner's claim (hours_status='extracted')
-    so the next extraction repopulates them from the documents. Without this, one stray
-    save — e.g. accepting the all-closed blank week the panel seeds when nothing was
-    extracted yet — would silently disable hours extraction for that persona forever,
-    with no route back through the console.
+    `hours: null` / `contact: null` are the way BACK: each clears the owner's claim on that
+    card (…_status='extracted') so the next extraction repopulates it from the documents.
+    Without this, one stray save — e.g. accepting the all-closed blank week the panel seeds
+    when nothing was extracted yet — would silently disable that card's extraction for the
+    persona forever, with no route back through the console. Note the distinction on
+    contact: `null` hands the card back, whereas `{}` is an owner-claimed "we publish no
+    contact details" and is respected as such.
     """
     fields = body.model_dump(exclude_unset=True)
     if not fields:
@@ -650,6 +708,12 @@ async def update_business_settings(
         else:
             sets.append("hours = %(hours)s, hours_status = 'edited'")
             params["hours"] = Jsonb(fields["hours"])
+    if "contact" in fields:
+        if fields["contact"] is None:
+            sets.append("contact = null, contact_status = 'extracted'")
+        else:
+            sets.append("contact = %(contact)s, contact_status = 'edited'")
+            params["contact"] = Jsonb(fields["contact"])
     for col in ("slot_minutes", "buffer_minutes"):
         if col in fields and fields[col] is not None:
             sets.append(f"{col} = %({col})s")
