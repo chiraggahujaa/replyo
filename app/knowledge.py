@@ -28,6 +28,7 @@ from bs4 import BeautifulSoup
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
+from app.extraction import extract_catalog
 from app.rag import build_store
 from app.tenancy import scoped_connection
 
@@ -190,6 +191,14 @@ async def ingest_upload(*, tenant_id: str, source_id: str, name: str, text: str)
             last_ingested_at=datetime.now(UTC),
         )
         logger.info("Ingested upload %s (%d chunks) for tenant %s", name, len(docs), tenant_id)
+        # Refresh the structured catalog from the new knowledge. Own guard: an
+        # extraction failure must not flip a source that ingested fine to 'error',
+        # and extract_catalog's running-guard makes concurrent finishes safe (the
+        # second caller flags a re-run for the one already in flight).
+        try:
+            await extract_catalog(tenant_id)
+        except Exception:
+            logger.exception("Catalog extraction failed after upload for tenant %s", tenant_id)
     except Exception as exc:
         logger.exception("Upload ingest failed for %s", source_id)
         await _set_status(tenant_id, source_id, "error", error=str(exc)[:500])
@@ -232,6 +241,11 @@ async def ingest_website(
         logger.info(
             "Crawled %s: %d pages -> %d chunks for tenant %s", url, len(pages), len(docs), tenant_id
         )
+        # Same post-ingest catalog refresh as uploads — see the comment there.
+        try:
+            await extract_catalog(tenant_id)
+        except Exception:
+            logger.exception("Catalog extraction failed after crawl for tenant %s", tenant_id)
     except Exception as exc:
         logger.exception("Website ingest failed for %s", source_id)
         await _set_status(tenant_id, source_id, "error", error=str(exc)[:500])

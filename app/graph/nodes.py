@@ -66,8 +66,13 @@ def _tenant(config: RunnableConfig | None) -> dict:
 
 
 def _system_prompt(config: RunnableConfig | None) -> str:
-    """This persona's generated instruction, or the generic fallback."""
-    return _tenant(config).get("system_prompt") or PERSONA
+    """This persona's generated instruction (or the generic fallback), plus the curated
+    business guidelines when the catalog pipeline has produced any — the
+    `guidelines_block` is attached to the tenant dict per turn by app/inbound.py."""
+    tenant = _tenant(config)
+    prompt = tenant.get("system_prompt") or PERSONA
+    guidelines = tenant.get("guidelines_block")
+    return f"{prompt}\n\n{guidelines}" if guidelines else prompt
 
 
 def _tenant_id(config: RunnableConfig | None) -> str:
@@ -658,16 +663,23 @@ def answer_from_docs(state: ConversationState, config: RunnableConfig) -> dict:
     # embedding of its "[image attached]" text marker can never match. The hard
     # refusal below therefore gates text-only turns exclusively.
     with_images = _latest_turn_has_images(state)
+    # The owner-reviewed catalog (built by app/catalog.py, attached per turn by
+    # app/inbound.py) is valid grounding on its own: when present it rides ahead of
+    # the retrieved chunks AND bypasses the empty-retrieval refusal below.
+    catalog_block = _tenant(config).get("catalog_block")
     hits = retrieve(query, tenant_id=_tenant_id(config), k=RETRIEVAL_K)
     relevant = [(doc, dist) for doc, dist in hits if dist <= MAX_DISTANCE]
 
-    # Guard 1: nothing relevant -> refuse, don't hallucinate.
-    if not relevant and not with_images:
+    # Guard 1: nothing relevant (and no catalog to answer from) -> refuse, don't hallucinate.
+    if not relevant and not with_images and not catalog_block:
         return {"messages": [AIMessage(content=REFUSAL)], "citations": []}
 
     # Build a numbered context block and the ordered, de-duped source list.
     sources: list[str] = []
     context_parts = []
+    if catalog_block:
+        sources.append("Business catalog")
+        context_parts.append(catalog_block)
     for i, (doc, _dist) in enumerate(relevant, start=1):
         src = doc.metadata.get("source", "unknown")
         if src not in sources:

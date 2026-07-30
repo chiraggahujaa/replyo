@@ -4,7 +4,7 @@
 // product. Pills for actions, glass cards, shimmer skeletons, one spinner.
 
 import Link from "next/link";
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { SparkIcon } from "./icons";
 
 /* ---- Spinner --------------------------------------------------------------------- */
@@ -224,6 +224,79 @@ export function Badge({
       {pulse && <span className="live-dot h-1.5 w-1.5 rounded-full bg-current" />}
       {children}
     </span>
+  );
+}
+
+/* ---- Tabs (segmented control) ------------------------------------------------------- */
+
+/** Pill segmented control. Generic — keys/labels/counts in, selection out. One Tab stop
+ *  for the whole group (roving tabindex + arrow keys), like native tabs. */
+export function Tabs({
+  tabs,
+  value,
+  onChange,
+  className = "",
+}: {
+  tabs: { key: string; label: string; count?: number }[];
+  value: string;
+  onChange: (key: string) => void;
+  className?: string;
+}) {
+  const listRef = useRef<HTMLDivElement>(null);
+
+  const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) return;
+    e.preventDefault();
+    const cur = Math.max(0, tabs.findIndex((t) => t.key === value));
+    const next =
+      e.key === "Home"
+        ? 0
+        : e.key === "End"
+          ? tabs.length - 1
+          : e.key === "ArrowLeft"
+            ? (cur - 1 + tabs.length) % tabs.length
+            : (cur + 1) % tabs.length;
+    onChange(tabs[next].key);
+    listRef.current?.querySelectorAll<HTMLElement>('[role="tab"]')[next]?.focus();
+  };
+
+  return (
+    <div
+      ref={listRef}
+      role="tablist"
+      onKeyDown={onKeyDown}
+      className={`glass inline-flex max-w-full flex-wrap items-center gap-1 rounded-full border border-[var(--color-border)] p-1 ${className}`}
+    >
+      {tabs.map((t) => {
+        const selected = t.key === value;
+        return (
+          <button
+            key={t.key}
+            type="button"
+            role="tab"
+            aria-selected={selected}
+            tabIndex={selected ? 0 : -1}
+            onClick={() => onChange(t.key)}
+            className={`inline-flex items-center gap-1.5 rounded-full px-4 py-1.5 text-[13.5px] font-semibold tracking-tight transition-all duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring)] ${
+              selected
+                ? "border border-[var(--color-border)] bg-[var(--color-surface)] text-[var(--color-accent-ink)] shadow-sm"
+                : "border border-transparent text-[var(--color-muted)] hover:text-[var(--color-text)]"
+            }`}
+          >
+            {t.label}
+            {typeof t.count === "number" && (
+              <span
+                className={`text-[11.5px] font-semibold tabular-nums ${
+                  selected ? "text-[var(--color-muted)]" : "text-[var(--color-faint)]"
+                }`}
+              >
+                {t.count}
+              </span>
+            )}
+          </button>
+        );
+      })}
+    </div>
   );
 }
 

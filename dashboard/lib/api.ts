@@ -131,6 +131,109 @@ export async function uploadDocument(tenantId: string, file: File): Promise<Know
   return res.json();
 }
 
+// ---- catalog ----
+
+export type CatalogItem = {
+  id: string;
+  kind: "service" | "product";
+  name: string;
+  description: string | null;
+  price_text: string | null;
+  price_amount: number | null;
+  currency: string | null;
+  duration_min: number | null;
+  category: string | null;
+  image_url: string | null;
+  sort: number;
+  source: string | null;
+  status: "extracted" | "edited";
+  created_at: string;
+  updated_at: string;
+};
+
+export type CatalogSnippet = {
+  id: string;
+  kind: "guideline" | "content";
+  title: string;
+  body: string;
+  source: string | null;
+  sort: number;
+  status: "extracted" | "edited";
+  created_at: string;
+  updated_at: string;
+};
+
+export type CatalogResponse = {
+  items: CatalogItem[];
+  snippets: CatalogSnippet[];
+  extraction: {
+    status: "idle" | "running" | "done" | "error";
+    error: string | null;
+    last_extracted_at: string | null;
+  };
+};
+
+/** Writable item fields; PATCH sends any subset, POST requires kind + name. */
+export type CatalogItemInput = {
+  kind: "service" | "product";
+  name: string;
+  description?: string | null;
+  price_text?: string | null;
+  price_amount?: number | null;
+  currency?: string | null;
+  duration_min?: number | null;
+  category?: string | null;
+};
+
+export type CatalogSnippetInput = {
+  kind: "guideline" | "content";
+  title: string;
+  body: string;
+};
+
+export const getCatalog = (tenantId: string) =>
+  req<CatalogResponse>("/api/personas/active/catalog", { tenantId });
+export const createCatalogItem = (tenantId: string, body: CatalogItemInput) =>
+  req<CatalogItem>("/api/personas/active/catalog/items", {
+    method: "POST",
+    tenantId,
+    body: JSON.stringify(body),
+  });
+export const updateCatalogItem = (
+  tenantId: string,
+  id: string,
+  body: Partial<Omit<CatalogItemInput, "kind">>,
+) =>
+  req<CatalogItem>(`/api/personas/active/catalog/items/${id}`, {
+    method: "PATCH",
+    tenantId,
+    body: JSON.stringify(body),
+  });
+export const deleteCatalogItem = (tenantId: string, id: string) =>
+  req<void>(`/api/personas/active/catalog/items/${id}`, { method: "DELETE", tenantId });
+export const createSnippet = (tenantId: string, body: CatalogSnippetInput) =>
+  req<CatalogSnippet>("/api/personas/active/catalog/snippets", {
+    method: "POST",
+    tenantId,
+    body: JSON.stringify(body),
+  });
+export const updateSnippet = (
+  tenantId: string,
+  id: string,
+  body: Partial<Pick<CatalogSnippet, "title" | "body">>,
+) =>
+  req<CatalogSnippet>(`/api/personas/active/catalog/snippets/${id}`, {
+    method: "PATCH",
+    tenantId,
+    body: JSON.stringify(body),
+  });
+export const deleteSnippet = (tenantId: string, id: string) =>
+  req<void>(`/api/personas/active/catalog/snippets/${id}`, { method: "DELETE", tenantId });
+// 202 always (idempotent while a run is in flight); 409 "Add knowledge first" when the
+// persona has no ready knowledge sources to extract from.
+export const triggerExtraction = (tenantId: string) =>
+  req<{ status: string }>("/api/personas/active/catalog/extract", { method: "POST", tenantId });
+
 // ---- reviews (persona-scoped) ----
 
 export const listReviews = (tenantId: string) => req<Review[]>("/reviews", { tenantId });

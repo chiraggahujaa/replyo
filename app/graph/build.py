@@ -16,6 +16,8 @@ from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command
+from psycopg.rows import dict_row
+from psycopg_pool import AsyncConnectionPool
 
 from app.config import settings
 from app.graph.nodes import (
@@ -97,11 +99,23 @@ async def graph_with_checkpointer():
         async with graph_with_checkpointer() as graph:
             await graph.ainvoke(..., config=...)
 
-    The AsyncPostgresSaver owns a connection pool, so it must be entered/exited as
-    a context manager — that's why callers get the graph via this helper.
+    The checkpointer is backed by a small connection pool with a health check at
+    checkout (`check_connection`): Supabase's pooler silently drops idle connections,
+    and with the previous single long-lived connection (`from_conn_string`) one drop
+    meant every subsequent aget_state/ainvoke raised "the connection is closed" until
+    the process was restarted. The pool discards dead connections and dials a fresh
+    one instead. Connection kwargs mirror what from_conn_string used (autocommit,
+    no prepared statements, dict rows).
     """
-    async with AsyncPostgresSaver.from_conn_string(settings.database_url) as checkpointer:
-        yield build_graph(checkpointer)
+    async with AsyncConnectionPool(
+        settings.database_url,
+        min_size=1,
+        max_size=4,
+        open=False,
+        check=AsyncConnectionPool.check_connection,
+        kwargs={"autocommit": True, "prepare_threshold": 0, "row_factory": dict_row},
+    ) as pool:
+        yield build_graph(AsyncPostgresSaver(conn=pool))
 
 
 def _trace_config(thread_id: str, *, channel: str, run_name: str, tenant: dict | None = None) -> dict:

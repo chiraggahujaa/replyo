@@ -207,6 +207,22 @@ export const PencilIcon = ({ className }: P) => (
   </svg>
 );
 
+export const LayersIcon = ({ className }: P) => (
+  <svg viewBox="0 0 24 24" fill="none" className={className} aria-hidden>
+    <path d="M12 2.5L2.5 7.75 12 13l9.5-5.25L12 2.5z"
+      stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
+    <path d="M2.5 12.25L12 17.5l9.5-5.25M2.5 16.75L12 22l9.5-5.25"
+      stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
+  </svg>
+);
+
+export const ClockIcon = ({ className }: P) => (
+  <svg viewBox="0 0 24 24" fill="none" className={className} aria-hidden>
+    <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="1.7" />
+    <path d="M12 7.5V12l3 2" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
+  </svg>
+);
+
 export const WandIcon = ({ className }: P) => (
   <svg viewBox="0 0 24 24" fill="none" className={className} aria-hidden>
     <path d="M5 3v4M3 5h4M6 17v4M4 19h4M13 3l2.3 6.3L21 11l-5.7 1.7L13 19l-2.3-6.3L5 11l5.7-1.7L13 3z"

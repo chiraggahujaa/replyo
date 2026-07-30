@@ -348,3 +348,11 @@ scripts/
 - ~~**Step 9** — multi-tenant SaaS: Supabase Auth, Postgres RLS isolation, per-persona
   knowledge (uploads + website crawl) & generated prompts, tenant-keyed widget, admin console~~ ✅
   *(phase 1: web widget; Telegram/WhatsApp and booking stay single-tenant for now)*
+- ~~**Step 10** — console UI overhaul + landing page, per-persona widget theming
+  (brand color, images), live dashboard via websockets, lint/CI tooling~~ ✅
+- ~~**Step 11** — structured business catalog: LLM extraction of services/products (with
+  verbatim pricing), guidelines, and content from ingested knowledge into editable tables
+  (`catalog_items`, `business_snippets`), auto-run after each ingest with a re-extract
+  endpoint; console **Catalog** page (tabbed, inline editing, user edits never overwritten
+  by re-extraction); agent answers pricing/services from the catalog and follows extracted
+  guidelines via the system prompt~~ ✅

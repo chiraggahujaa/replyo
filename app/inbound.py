@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 
-from app import followups, reviews
+from app import catalog, followups, reviews
 from app.graph.build import run_turn
 
 logger = logging.getLogger("replyo.inbound")
@@ -46,6 +46,13 @@ async def handle_inbound(
     same turn (the web widget's HTTP path today) — validated upstream, opaque here.
     """
     tenant_id = str(tenant["id"])
+    # Enrich the persona with its curated catalog + guidelines blocks (app/catalog.py)
+    # so the graph can ground answers in owner-reviewed data. Best-effort: a context
+    # load failing must never break the reply — same posture as record_turn below.
+    try:
+        tenant = {**tenant, **await catalog.load_business_context(tenant_id)}
+    except Exception:
+        logger.exception("Could not load business context for tenant %s", tenant_id)
     result = await run_turn(
         graph, thread_id, text, channel=channel, tenant=tenant, on_token=on_token, images=images
     )

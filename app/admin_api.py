@@ -14,10 +14,12 @@ from __future__ import annotations
 import logging
 from typing import Literal
 
+import psycopg.errors
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, UploadFile
 from psycopg.types.json import Jsonb
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
+from app import extraction
 from app.knowledge import ingest_upload, ingest_website
 from app.persona import generate_system_prompt
 from app.rag import build_store
@@ -70,6 +72,59 @@ class AddWebsite(BaseModel):
 class GeneratePrompt(BaseModel):
     name: str
     notes: str = ""
+
+
+def _not_blank(value: str | None) -> str | None:
+    """Shared validator body: strip, and reject a value that's only whitespace."""
+    if value is None:
+        return None
+    value = value.strip()
+    if not value:
+        raise ValueError("must not be blank")
+    return value
+
+
+class CreateCatalogItem(BaseModel):
+    kind: Literal["service", "product"]
+    name: str = Field(..., max_length=200)
+    description: str | None = Field(None, max_length=2000)
+    price_text: str | None = Field(None, max_length=100)
+    price_amount: float | None = Field(None, ge=0)
+    currency: str | None = Field(None, max_length=50)
+    duration_min: int | None = Field(None, ge=1, le=600)
+    category: str | None = Field(None, max_length=50)
+
+    _name_not_blank = field_validator("name")(_not_blank)
+
+
+class UpdateCatalogItem(BaseModel):
+    """PATCH body: any subset of the create fields (unset fields are left untouched)."""
+
+    kind: Literal["service", "product"] | None = None
+    name: str | None = Field(None, max_length=200)
+    description: str | None = Field(None, max_length=2000)
+    price_text: str | None = Field(None, max_length=100)
+    price_amount: float | None = Field(None, ge=0)
+    currency: str | None = Field(None, max_length=50)
+    duration_min: int | None = Field(None, ge=1, le=600)
+    category: str | None = Field(None, max_length=50)
+
+    _name_not_blank = field_validator("name")(_not_blank)
+
+
+class CreateSnippet(BaseModel):
+    kind: Literal["guideline", "content"]
+    title: str = Field(..., max_length=200)
+    body: str = Field(..., max_length=5000)
+
+    _not_blank = field_validator("title", "body")(_not_blank)
+
+
+class UpdateSnippet(BaseModel):
+    title: str | None = Field(None, max_length=200)
+    body: str | None = Field(None, max_length=5000)
+
+    _not_blank = field_validator("title", "body")(_not_blank)
 
 
 async def _require_tenant(
@@ -255,3 +310,166 @@ async def delete_knowledge(source_id: str, tenant: dict = Depends(_require_tenan
     re-ingest — per-chunk deletion is a later refinement.)"""
     async with await scoped_connection(tenant_id=str(tenant["id"])) as conn:
         await conn.execute("delete from knowledge_sources where id = %s", (source_id,))
+
+
+# ---------------------------------------------------------------------------
+# business catalog (structured extraction — app/extraction.py writes, this reviews)
+# ---------------------------------------------------------------------------
+
+@router.get("/personas/active/catalog")
+async def get_catalog(tenant: dict = Depends(_require_tenant)) -> dict:
+    """Everything the catalog console shows: items, snippets, and the extraction state.
+
+    A tenant that has never extracted has no business_profiles row yet — that's the
+    'idle' state, not an error. A 'running' left behind by a process that died mid-run
+    is coerced to 'error' first, so the console recovers on its next load instead of
+    showing an extraction that will never finish.
+    """
+    tid = str(tenant["id"])
+    await extraction.reset_stale_run(tid)
+    async with await scoped_connection(tenant_id=tid) as conn:
+        items = await (await conn.execute(
+            "select * from catalog_items where tenant_id = %s "
+            "order by kind, category nulls last, lower(name)",
+            (tid,),
+        )).fetchall()
+        snippets = await (await conn.execute(
+            "select * from business_snippets where tenant_id = %s "
+            "order by kind, sort, lower(title)",
+            (tid,),
+        )).fetchall()
+        profile = await (await conn.execute(
+            "select * from business_profiles where tenant_id = %s", (tid,)
+        )).fetchone()
+    return {
+        "items": items,
+        "snippets": snippets,
+        "extraction": {
+            "status": profile["extraction_status"] if profile else "idle",
+            "error": profile["extraction_error"] if profile else None,
+            "last_extracted_at": profile["last_extracted_at"] if profile else None,
+        },
+    }
+
+
+@router.post("/personas/active/catalog/items", status_code=201)
+async def create_catalog_item(
+    body: CreateCatalogItem, tenant: dict = Depends(_require_tenant)
+) -> dict:
+    """Hand-added items are the owner's word from birth: status='edited', so a later
+    extraction run can never overwrite them."""
+    tid = str(tenant["id"])
+    async with await scoped_connection(tenant_id=tid) as conn:
+        try:
+            row = await (await conn.execute(
+                "insert into catalog_items (tenant_id, kind, name, description, price_text, "
+                "price_amount, currency, duration_min, category, status) "
+                "values (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'edited') returning *",
+                (tid, body.kind, body.name, body.description, body.price_text,
+                 body.price_amount, body.currency, body.duration_min, body.category),
+            )).fetchone()
+        except psycopg.errors.UniqueViolation:
+            raise HTTPException(409, f"A {body.kind} named {body.name!r} already exists.") from None
+    assert row is not None  # INSERT .. RETURNING always yields the new row
+    return row
+
+
+@router.patch("/personas/active/catalog/items/{item_id}")
+async def update_catalog_item(
+    item_id: str, body: UpdateCatalogItem, tenant: dict = Depends(_require_tenant)
+) -> dict:
+    """Apply any subset of fields; the row becomes (or stays) status='edited'."""
+    fields = body.model_dump(exclude_unset=True)
+    for col in ("kind", "name"):  # NOT NULL columns — an explicit null isn't a clear
+        if col in fields and fields[col] is None:
+            fields.pop(col)
+    sets = "".join(f"{k} = %s, " for k in fields) + "status = 'edited', updated_at = now()"
+    params = [*fields.values(), item_id, str(tenant["id"])]
+    async with await scoped_connection(tenant_id=str(tenant["id"])) as conn:
+        try:
+            row = await (await conn.execute(
+                # Column names come from the whitelisted pydantic model, never the
+                # client — the dynamic SQL is trusted (hence the pyright ignore).
+                f"update catalog_items set {sets} where id = %s and tenant_id = %s returning *",  # pyright: ignore[reportArgumentType]
+                tuple(params),
+            )).fetchone()
+        except psycopg.errors.UniqueViolation:
+            raise HTTPException(409, "An item of that kind with that name already exists.") from None
+    if not row:
+        raise HTTPException(404, "Catalog item not found")
+    return row
+
+
+@router.delete("/personas/active/catalog/items/{item_id}", status_code=204)
+async def delete_catalog_item(item_id: str, tenant: dict = Depends(_require_tenant)) -> None:
+    async with await scoped_connection(tenant_id=str(tenant["id"])) as conn:
+        await conn.execute("delete from catalog_items where id = %s", (item_id,))
+
+
+@router.post("/personas/active/catalog/snippets", status_code=201)
+async def create_snippet(body: CreateSnippet, tenant: dict = Depends(_require_tenant)) -> dict:
+    tid = str(tenant["id"])
+    async with await scoped_connection(tenant_id=tid) as conn:
+        try:
+            row = await (await conn.execute(
+                "insert into business_snippets (tenant_id, kind, title, body, status) "
+                "values (%s, %s, %s, %s, 'edited') returning *",
+                (tid, body.kind, body.title, body.body),
+            )).fetchone()
+        except psycopg.errors.UniqueViolation:
+            raise HTTPException(409, f"A {body.kind} titled {body.title!r} already exists.") from None
+    assert row is not None  # INSERT .. RETURNING always yields the new row
+    return row
+
+
+@router.patch("/personas/active/catalog/snippets/{snippet_id}")
+async def update_snippet(
+    snippet_id: str, body: UpdateSnippet, tenant: dict = Depends(_require_tenant)
+) -> dict:
+    fields = {k: v for k, v in body.model_dump(exclude_unset=True).items() if v is not None}
+    sets = "".join(f"{k} = %s, " for k in fields) + "status = 'edited', updated_at = now()"
+    params = [*fields.values(), snippet_id, str(tenant["id"])]
+    async with await scoped_connection(tenant_id=str(tenant["id"])) as conn:
+        try:
+            row = await (await conn.execute(
+                # Whitelisted column names again — trusted dynamic SQL.
+                f"update business_snippets set {sets} where id = %s and tenant_id = %s returning *",  # pyright: ignore[reportArgumentType]
+                tuple(params),
+            )).fetchone()
+        except psycopg.errors.UniqueViolation:
+            raise HTTPException(409, "A snippet of that kind with that title already exists.") from None
+    if not row:
+        raise HTTPException(404, "Snippet not found")
+    return row
+
+
+@router.delete("/personas/active/catalog/snippets/{snippet_id}", status_code=204)
+async def delete_snippet(snippet_id: str, tenant: dict = Depends(_require_tenant)) -> None:
+    async with await scoped_connection(tenant_id=str(tenant["id"])) as conn:
+        await conn.execute("delete from business_snippets where id = %s", (snippet_id,))
+
+
+@router.post("/personas/active/catalog/extract", status_code=202)
+async def extract_catalog_now(
+    background: BackgroundTasks, tenant: dict = Depends(_require_tenant)
+) -> dict:
+    """Kick off (or join) a structured extraction run over the ingested knowledge.
+
+    409 only when there is nothing ready to extract from. Otherwise idempotent: the
+    single-statement guard in extraction.mark_running decides whether we schedule a
+    run or one is already in flight — either way the client's desired state ('an
+    extraction is running') is true, so both answers are 202.
+    """
+    tid = str(tenant["id"])
+    async with await scoped_connection(tenant_id=tid) as conn:
+        ready = await (await conn.execute(
+            "select 1 from knowledge_sources where tenant_id = %s and status = 'ready' limit 1",
+            (tid,),
+        )).fetchone()
+    if not ready:
+        raise HTTPException(409, "Add knowledge first")
+    if await extraction.mark_running(tid):
+        # We just claimed the run, so the task skips its own guard (already_marked) —
+        # scheduled exactly like the knowledge upload route schedules ingest.
+        background.add_task(extraction.extract_catalog, tid, already_marked=True)
+    return {"status": "running"}

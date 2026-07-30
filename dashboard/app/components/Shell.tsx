@@ -12,6 +12,7 @@ import {
   ChevronDownIcon,
   CodeIcon,
   InboxIcon,
+  LayersIcon,
   LogoutIcon,
   PlusIcon,
   SparkIcon,
@@ -22,6 +23,7 @@ const NAV = [
   { href: "/queue", label: "Review queue", icon: InboxIcon },
   { href: "/personas", label: "Personas", icon: UsersIcon },
   { href: "/knowledge", label: "Knowledge", icon: BookIcon },
+  { href: "/catalog", label: "Catalog", icon: LayersIcon },
   { href: "/install", label: "Install", icon: CodeIcon },
 ];
 
