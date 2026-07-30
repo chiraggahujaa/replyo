@@ -7,20 +7,31 @@
 // from the machine and what they've already vetted. While an extraction runs we poll
 // every 3s (extraction is a background job with no push channel of its own) and stop
 // the moment it settles.
+//
+// Loading is deliberately lazy and paged, because a real persona has hundreds of rows:
+// `getCatalog` fetches metadata only (counts, extraction state, settings) and each tab
+// fetches its own rows PAGE_SIZE at a time, the first page on first visit and the rest
+// as the reader scrolls. Switching to Services never downloads Products.
 
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import {
+  type CatalogCounts,
   type CatalogItem,
   type CatalogItemInput,
+  type CatalogItemKind,
   type CatalogResponse,
   type CatalogSettings,
   type CatalogSnippet,
+  type CatalogSnippetKind,
+  type EntryKind,
   createCatalogItem,
   createSnippet,
   deleteCatalogImage,
   deleteCatalogItem,
   deleteSnippet,
   getCatalog,
+  listCatalogItems,
+  listCatalogSnippets,
   timeAgo,
   triggerExtraction,
   updateCatalogItem,
@@ -66,12 +77,14 @@ const POLL_MS = 3000;
 // Two-click confirms (re-extract, delete, remove photo) fall back to the safe label
 // after this.
 const CONFIRM_MS = 3200;
+/** Rows per request. Small enough that the first screen of a tab arrives immediately,
+ *  large enough that a page always overflows the viewport and so the scroll sentinel
+ *  starts out below the fold. */
+const PAGE_SIZE = 15;
 
-type ItemKind = "service" | "product";
-type SnippetKind = "guideline" | "content";
-/** The four tabs backed by catalog rows. "hours" is the fifth tab — a settings editor,
- *  not a list, so it has no add label, plural or count. */
-type EntryKind = ItemKind | SnippetKind;
+/** The four tabs backed by catalog rows (`EntryKind`, from lib/api — the same union the
+ *  counts payload and the entries endpoint are keyed by). "hours" is the fifth tab — a
+ *  settings editor, not a list, so it has no add label, plural or count. */
 type TabKey = EntryKind | "hours";
 
 const TAB_META: Record<EntryKind, { label: string; add: string; plural: string }> = {
@@ -120,6 +133,64 @@ function priceLabel(item: CatalogItem): string | null {
   return formatPrice(item.price_amount, item.currency);
 }
 
+/* ---- Per-tab paged row cache -------------------------------------------------------- */
+
+/** One tab's worth of rows. `cursor` is the opaque token for the NEXT page (null = the
+ *  list is exhausted, so there is no sentinel and no wasted request); `loaded` says the
+ *  first page has landed, which is what stops a re-visit from re-fetching. */
+type PageCache<T> = {
+  rows: T[];
+  cursor: string | null;
+  loading: boolean;
+  loaded: boolean;
+  error: string | null;
+};
+
+type ItemCaches = Record<CatalogItemKind, PageCache<CatalogItem>>;
+type SnippetCaches = Record<CatalogSnippetKind, PageCache<CatalogSnippet>>;
+
+const blankCache = <T,>(): PageCache<T> => ({
+  rows: [],
+  cursor: null,
+  loading: false,
+  loaded: false,
+  error: null,
+});
+
+/** Invalidation keeps the rows already on screen and only clears the paging state, so a
+ *  refetch (after an extraction settles) swaps the list when the fresh first page lands
+ *  instead of blanking the tab — and an open editor keeps its row, and its typed text. */
+const staleCache = <T,>(c: PageCache<T>): PageCache<T> => ({
+  rows: c.rows,
+  cursor: null,
+  loading: false,
+  loaded: false,
+  error: null,
+});
+
+/** Fold a fetched page in. The first page replaces (that's the refetch path); later pages
+ *  append, skipping ids already held so a row created locally — or an overlap at a page
+ *  boundary — can never produce two cards with the same key. */
+function applyPage<T extends { id: string }>(
+  prev: PageCache<T>,
+  entries: T[],
+  next: string | null,
+  first: boolean,
+): PageCache<T> {
+  const seen = new Set(prev.rows.map((r) => r.id));
+  return {
+    rows: first ? entries : [...prev.rows, ...entries.filter((e) => !seen.has(e.id))],
+    cursor: next,
+    loading: false,
+    loaded: true,
+    error: null,
+  };
+}
+
+/** What the tab panel's body is showing. Decided once in `Catalog` so the header's Add
+ *  button and the section below it can never disagree about which state we're in. */
+type PanelView = "skeletons" | "error" | "empty" | "list";
+
 export default function CatalogPage() {
   return (
     <Shell>
@@ -159,35 +230,134 @@ function Catalog({ tenantId, personaName }: { tenantId: string; personaName: str
   const statusRef = useRef<CatalogResponse["extraction"]["status"] | null>(null);
   const confirmTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // One cache per row shape rather than one keyed by EntryKind: a union of PageCache<Item>
+  // and PageCache<Snippet> would need narrowing at every touch, and there is nothing to
+  // narrow on. Two records, each already the right type.
+  const [itemCache, setItemCache] = useState<ItemCaches>(() => ({
+    service: blankCache(),
+    product: blankCache(),
+  }));
+  const [snippetCache, setSnippetCache] = useState<SnippetCaches>(() => ({
+    guideline: blankCache(),
+    content: blankCache(),
+  }));
+  // The `(kind, cursor)` pairs currently in flight. This — not a boolean — is what makes a
+  // double-fetch impossible: the observer can fire repeatedly for the same sentinel, and
+  // every extra call finds its key already claimed and returns.
+  const inflight = useRef<Set<string>>(new Set());
+  // Bumped by every invalidation. A request that resolves against an older generation is
+  // dropped, so rows fetched before an extraction settled can't append after it.
+  const genRef = useRef(0);
+  // The element observed to trigger the next page. Held in state (not a ref) so the
+  // observer effect re-runs the moment it mounts, remounts or unmounts.
+  const [sentinel, setSentinel] = useState<HTMLDivElement | null>(null);
+  // The panel wrapper, NOT the sticky header inside it: a pinned sticky element already
+  // reports itself as being at the top of the scrollport, so scrollIntoView on it does
+  // nothing. Its non-sticky container is the thing that actually scrolls back into place.
+  const panelRef = useRef<HTMLDivElement>(null);
+
   const pushToast = useCallback((kind: ToastItem["kind"], text: string) => {
     const id = ++toastSeq.current;
     setToasts((t) => [...t, { id, kind, text }]);
     setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 3800);
   }, []);
 
-  // Apply a fresh snapshot and announce the running -> done/error transition. Lives on
-  // the fetch path (not an effect watching `data`) so each transition toasts exactly
-  // once, no matter how renders interleave.
+  const updateItems = useCallback(
+    (kind: CatalogItemKind, patch: (c: PageCache<CatalogItem>) => PageCache<CatalogItem>) =>
+      setItemCache((c) => {
+        const next = { ...c };
+        next[kind] = patch(c[kind]);
+        return next;
+      }),
+    [],
+  );
+
+  const updateSnippets = useCallback(
+    (kind: CatalogSnippetKind, patch: (c: PageCache<CatalogSnippet>) => PageCache<CatalogSnippet>) =>
+      setSnippetCache((c) => {
+        const next = { ...c };
+        next[kind] = patch(c[kind]);
+        return next;
+      }),
+    [],
+  );
+
+  /** Drop every tab's paging state. The active tab's first-page effect picks it up on the
+   *  next commit; the other three stay unfetched until someone visits them. */
+  const invalidateEntries = useCallback(() => {
+    genRef.current += 1;
+    inflight.current.clear();
+    setItemCache((c) => ({ service: staleCache(c.service), product: staleCache(c.product) }));
+    setSnippetCache((c) => ({
+      guideline: staleCache(c.guideline),
+      content: staleCache(c.content),
+    }));
+  }, []);
+
+  /** Fetch one page of `kind`. `cursor === null` asks for the first page. */
+  const loadPage = useCallback(
+    async (kind: EntryKind, cursor: string | null) => {
+      const key = `${kind}|${cursor ?? ""}`;
+      if (inflight.current.has(key)) return;
+      inflight.current.add(key);
+      const gen = genRef.current;
+      const first = cursor === null;
+      const opts = { limit: PAGE_SIZE, cursor: cursor ?? undefined };
+      try {
+        if (kind === "service" || kind === "product") {
+          updateItems(kind, (c) => ({ ...c, loading: true, error: null }));
+          const page = await listCatalogItems(tenantId, kind, opts);
+          if (genRef.current !== gen) return;
+          updateItems(kind, (c) => applyPage(c, page.entries, page.next_cursor, first));
+        } else {
+          updateSnippets(kind, (c) => ({ ...c, loading: true, error: null }));
+          const page = await listCatalogSnippets(tenantId, kind, opts);
+          if (genRef.current !== gen) return;
+          updateSnippets(kind, (c) => applyPage(c, page.entries, page.next_cursor, first));
+        }
+      } catch (e) {
+        if (genRef.current !== gen) return;
+        const msg = errText(e, "Couldn’t load these rows");
+        if (kind === "service" || kind === "product")
+          updateItems(kind, (c) => ({ ...c, loading: false, error: msg }));
+        else updateSnippets(kind, (c) => ({ ...c, loading: false, error: msg }));
+      } finally {
+        inflight.current.delete(key);
+      }
+    },
+    [tenantId, updateItems, updateSnippets],
+  );
+
+  // Apply a fresh metadata snapshot and announce the running -> done/error transition.
+  // Lives on the fetch path (not an effect watching `data`) so each transition toasts
+  // exactly once, no matter how renders interleave — and so the rows an extraction just
+  // rewrote are invalidated exactly once too.
   const applyData = useCallback(
     (d: CatalogResponse) => {
       const prev = statusRef.current;
       statusRef.current = d.extraction.status;
       setData(d);
-      if (prev === "running" && d.extraction.status === "done") {
-        const n = d.items.filter((i) => i.kind === "service").length;
-        const m = d.items.filter((i) => i.kind === "product").length;
+      if (prev !== "running") return;
+      if (d.extraction.status === "done") {
+        // Straight from the counts payload, which is the whole point of having one: the
+        // loaded rows are a single page and would undercount.
+        const n = d.counts.service;
+        const m = d.counts.product;
+        invalidateEntries();
         pushToast(
           "success",
           `Extraction complete — ${n} service${n === 1 ? "" : "s"}, ${m} product${m === 1 ? "" : "s"} found`,
         );
-      } else if (prev === "running" && d.extraction.status === "error") {
+      } else if (d.extraction.status === "error") {
+        invalidateEntries();
         pushToast("error", d.extraction.error || "Extraction failed");
       }
     },
-    [pushToast],
+    [pushToast, invalidateEntries],
   );
 
-  // Initial load (re-runs per persona thanks to the key remount).
+  // Initial metadata load (re-runs per persona thanks to the key remount). No rows here —
+  // the active tab fetches its own first page below.
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -205,8 +375,53 @@ function Catalog({ tenantId, personaName }: { tenantId: string; personaName: str
     };
   }, [tenantId, applyData]);
 
-  // Poll every 3s only while an extraction runs; the cleanup covers unmount and
-  // persona switch, and the effect retires itself when the status leaves "running".
+  // The active list tab and its cache. `null` on the Hours tab, which is a settings editor
+  // with no rows — so nothing below it ever fetches. Reading `.loading` / `.loaded` /
+  // `.error` / `.cursor` off the union is fine; only `.rows` needs the narrowed branch.
+  const active: EntryKind | null = tab === "hours" ? null : tab;
+  const activeCache: PageCache<CatalogItem> | PageCache<CatalogSnippet> | null =
+    active === null
+      ? null
+      : active === "service" || active === "product"
+        ? itemCache[active]
+        : snippetCache[active];
+
+  // First page of the active tab, once. Re-runs on every cache change (the deps say so)
+  // but the guards mean it only ever fires for a tab that has no page, none in flight and
+  // no error to clear — which is also what stops an errored tab retrying in a loop.
+  useEffect(() => {
+    if (active === null || activeCache === null) return;
+    if (activeCache.loaded || activeCache.loading || activeCache.error) return;
+    // `loaded === false` always means cursor === null, i.e. ask for the first page. Kicked
+    // off through an async wrapper, the same shape as the metadata load above — the fetch
+    // owns its own loading flag, so it must not be a bare synchronous call from an effect.
+    (async () => loadPage(active, null))();
+  }, [active, activeCache, loadPage]);
+
+  // Next page when the sentinel comes into view. Re-created whenever the sentinel node or
+  // the cache changes, so a page landing immediately re-observes: on a fast scroll the
+  // sentinel is still on screen, IntersectionObserver reports that on observe(), and the
+  // next page starts at once. The bail-outs (no node, nothing more to fetch, request in
+  // flight, unresolved error) mean the observer only exists when firing it is correct, and
+  // the cleanup disconnects it on unmount, tab change and every re-run.
+  useEffect(() => {
+    if (!sentinel || active === null || activeCache === null) return;
+    if (activeCache.cursor === null || activeCache.loading || activeCache.error) return;
+    const cursor = activeCache.cursor;
+    const io = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) void loadPage(active, cursor);
+      },
+      // Start the fetch a screenful early so rows are usually there before the reader is.
+      { rootMargin: "300px 0px" },
+    );
+    io.observe(sentinel);
+    return () => io.disconnect();
+  }, [sentinel, active, activeCache, loadPage]);
+
+  // Poll every 3s only while an extraction runs — the cheap metadata endpoint only, never
+  // the rows. The cleanup covers unmount and persona switch, and the effect retires itself
+  // when the status leaves "running".
   const running = data?.extraction.status === "running";
   useEffect(() => {
     if (!running) return;
@@ -244,6 +459,14 @@ function Catalog({ tenantId, personaName }: { tenantId: string; personaName: str
     }
   };
 
+  // Re-request whichever page failed — the first one (cursor null), or the next one
+  // mid-scroll. loadPage clears the error as it starts, which is also what un-parks the
+  // first-page effect and the observer; nothing retries on its own.
+  const retryEntries = () => {
+    if (active === null || activeCache === null) return;
+    void loadPage(active, activeCache.cursor);
+  };
+
   // Re-extract replaces machine-extracted rows, so a second click confirms — except the
   // very first run, when there's nothing to replace yet.
   const onExtract = async () => {
@@ -262,6 +485,9 @@ function Catalog({ tenantId, personaName }: { tenantId: string; personaName: str
       // Flip to running locally so polling starts before the next fetch confirms it.
       statusRef.current = "running";
       setData((d) => d && { ...d, extraction: { ...d.extraction, status: "running", error: null } });
+      // Every loaded page is about to be replaced server-side, so none of it can be
+      // trusted as "already fetched" any more.
+      invalidateEntries();
     } catch (e) {
       pushToast(
         "error",
@@ -274,10 +500,19 @@ function Catalog({ tenantId, personaName }: { tenantId: string; personaName: str
     }
   };
 
+  /** Put the top of the tab panel back at the top of the scroll pane. In an rAF so it runs
+   *  against the DOM the state change produced, not the one it replaced. */
+  const scrollPanelToTop = (behavior: ScrollBehavior) =>
+    requestAnimationFrame(() => panelRef.current?.scrollIntoView({ behavior, block: "start" }));
+
   const selectTab = (key: string) => {
     setTab(key as TabKey);
     setEditingId(null);
     setAdding(false);
+    // Every tab starts at its own beginning. Without this, switching from 200 loaded
+    // services to a 15-row tab would leave the scroll clamped near that short list's end —
+    // right on the sentinel, which would then start fetching pages to catch up.
+    scrollPanelToTop("auto");
   };
 
   const closeEditor = () => {
@@ -285,22 +520,37 @@ function Catalog({ tenantId, personaName }: { tenantId: string; personaName: str
     setAdding(false);
   };
 
-  const handleItemSaved = (saved: CatalogItem, created: boolean) => {
+  /** Opening the blank editor puts it at the TOP of the list — the end of the list is pages
+   *  away now — so the panel comes back into view with it. */
+  const startAdd = () => {
+    setEditingId(null);
+    setAdding(true);
+    scrollPanelToTop("smooth");
+  };
+
+  /** Keep the badge honest between metadata refreshes. Clamped at zero: a stale count and
+   *  a local delete must never produce "-1 services". */
+  const bumpCount = (kind: EntryKind, delta: number) =>
     setData(
       (d) =>
-        d && {
-          ...d,
-          items: sortItems(
-            created ? [...d.items, saved] : d.items.map((i) => (i.id === saved.id ? saved : i)),
-          ),
-        },
+        d && { ...d, counts: { ...d.counts, [kind]: Math.max(0, d.counts[kind] + delta) } },
     );
+
+  const handleItemSaved = (saved: CatalogItem, created: boolean) => {
+    // Sorted insert, so a saved card lands where a reload would put it — within the pages
+    // loaded so far, which is all this list claims to be.
+    updateItems(saved.kind, (c) => ({
+      ...c,
+      rows: sortItems(created ? [...c.rows, saved] : c.rows.map((i) => (i.id === saved.id ? saved : i))),
+    }));
+    if (created) bumpCount(saved.kind, 1);
     closeEditor();
     pushToast("success", created ? `${saved.kind === "service" ? "Service" : "Product"} added` : "Saved");
   };
 
-  const handleItemDeleted = (id: string) => {
-    setData((d) => d && { ...d, items: d.items.filter((i) => i.id !== id) });
+  const handleItemDeleted = (kind: CatalogItemKind, id: string) => {
+    updateItems(kind, (c) => ({ ...c, rows: c.rows.filter((i) => i.id !== id) }));
+    bumpCount(kind, -1);
     closeEditor();
     pushToast("success", "Deleted");
   };
@@ -310,9 +560,10 @@ function Catalog({ tenantId, personaName }: { tenantId: string; personaName: str
   // NOT closeEditor()/sorting: the owner is still mid-edit, and an image can't change
   // where the row sorts.
   const handleItemPatched = (updated: CatalogItem) => {
-    setData(
-      (d) => d && { ...d, items: d.items.map((i) => (i.id === updated.id ? updated : i)) },
-    );
+    updateItems(updated.kind, (c) => ({
+      ...c,
+      rows: c.rows.map((i) => (i.id === updated.id ? updated : i)),
+    }));
   };
 
   const handleSettingsSaved = (settings: CatalogSettings) => {
@@ -320,40 +571,32 @@ function Catalog({ tenantId, personaName }: { tenantId: string; personaName: str
   };
 
   const handleSnippetSaved = (saved: CatalogSnippet, created: boolean) => {
-    setData(
-      (d) =>
-        d && {
-          ...d,
-          snippets: sortSnippets(
-            created
-              ? [...d.snippets, saved]
-              : d.snippets.map((s) => (s.id === saved.id ? saved : s)),
-          ),
-        },
-    );
+    updateSnippets(saved.kind, (c) => ({
+      ...c,
+      rows: sortSnippets(
+        created ? [...c.rows, saved] : c.rows.map((s) => (s.id === saved.id ? saved : s)),
+      ),
+    }));
+    if (created) bumpCount(saved.kind, 1);
     closeEditor();
     pushToast("success", created ? (saved.kind === "guideline" ? "Guideline added" : "Note added") : "Saved");
   };
 
-  const handleSnippetDeleted = (id: string) => {
-    setData((d) => d && { ...d, snippets: d.snippets.filter((s) => s.id !== id) });
+  const handleSnippetDeleted = (kind: CatalogSnippetKind, id: string) => {
+    updateSnippets(kind, (c) => ({ ...c, rows: c.rows.filter((s) => s.id !== id) }));
+    bumpCount(kind, -1);
     closeEditor();
     pushToast("success", "Deleted");
   };
 
-  const items = data?.items ?? [];
-  const snippets = data?.snippets ?? [];
-  const counts: Record<EntryKind, number> = {
-    service: items.filter((i) => i.kind === "service").length,
-    product: items.filter((i) => i.kind === "product").length,
-    guideline: snippets.filter((s) => s.kind === "guideline").length,
-    content: snippets.filter((s) => s.kind === "content").length,
-  };
+  // Straight from the server's counts payload — the loaded rows are one page and would
+  // undercount. Absent until the first metadata response lands.
+  const counts: CatalogCounts | null = data?.counts ?? null;
   const tabs = [
     ...(Object.keys(TAB_META) as EntryKind[]).map((k) => ({
       key: k,
       label: TAB_META[k].label,
-      count: data ? counts[k] : undefined,
+      count: counts?.[k],
     })),
     // No count: hours isn't a list, and "7" would read as seven of something.
     { key: "hours", label: "Hours & booking" },
@@ -361,11 +604,28 @@ function Catalog({ tenantId, personaName }: { tenantId: string; personaName: str
 
   const extraction = data?.extraction;
   const everExtracted = !!extraction?.last_extracted_at;
-  // Skeletons cover both the first page load and an in-flight extraction on an empty
-  // tab — but never while an editor is open there, or starting an extraction would
-  // unmount the editor and silently discard whatever the user has typed.
-  const skeletonsFor = (count: number) =>
-    loading || (count === 0 && running && !adding && editingId === null);
+
+  const rowCount = activeCache?.rows.length ?? 0;
+  // One decision for the whole panel. Anything already on screen (rows, or the blank
+  // editor) wins — that's what keeps a refetch, or a starting extraction, from yanking an
+  // open editor out from under someone. Otherwise: skeletons while the first page or an
+  // extraction is working, the error card if that page failed, else the empty state.
+  const view: PanelView =
+    rowCount > 0 || adding
+      ? "list"
+      : loading || activeCache?.loading || (running && editingId === null)
+        ? "skeletons"
+        : activeCache?.error
+          ? "error"
+          : "empty";
+  // The list's own footnote: infinite scroll means "27" in the tab badge and what's on
+  // screen are different numbers, so say both while they differ.
+  const shownLabel =
+    active !== null && counts && counts[active] > 0
+      ? rowCount < counts[active]
+        ? `Showing ${rowCount} of ${counts[active]}`
+        : `${counts[active]} ${TAB_META[active].plural}`
+      : null;
 
   return (
     <div className="animate-in mx-auto w-full max-w-5xl px-6 py-8">
@@ -453,51 +713,71 @@ function Catalog({ tenantId, personaName }: { tenantId: string; personaName: str
               onToast={pushToast}
             />
           )
-        ) : tab === "service" || tab === "product" ? (
-          <ItemsSection
-            tenantId={tenantId}
-            kind={tab}
-            items={items.filter((i) => i.kind === tab)}
-            showSkeletons={skeletonsFor(counts[tab])}
-            everExtracted={everExtracted}
-            // Absent while the first load is in flight: assume "off" so the photo picker
-            // can't be clicked into a 503 before we know the server has storage at all.
-            storageEnabled={data?.storage_enabled ?? false}
-            editingId={editingId}
-            adding={adding}
-            extractBusy={extractBusy}
-            onEdit={setEditingId}
-            onStartAdd={() => {
-              setEditingId(null);
-              setAdding(true);
-            }}
-            onCloseEditor={closeEditor}
-            onSaved={handleItemSaved}
-            onDeleted={handleItemDeleted}
-            onPatched={handleItemPatched}
-            onToast={pushToast}
-            onExtract={onExtract}
-          />
         ) : (
-          <SnippetsSection
-            tenantId={tenantId}
-            kind={tab}
-            snippets={snippets.filter((s) => s.kind === tab)}
-            showSkeletons={skeletonsFor(counts[tab])}
-            everExtracted={everExtracted}
-            editingId={editingId}
-            adding={adding}
-            extractBusy={extractBusy}
-            onEdit={setEditingId}
-            onStartAdd={() => {
-              setEditingId(null);
-              setAdding(true);
-            }}
-            onCloseEditor={closeEditor}
-            onSaved={handleSnippetSaved}
-            onDeleted={handleSnippetDeleted}
-            onExtract={onExtract}
-          />
+          <>
+            {/* The tab panel's header row — where Add lives now that the end of a list is
+                pages away. Sticky (same idiom as the review queue's header) so it stays
+                reachable however far down the reader has scrolled. Hidden for the three
+                bodies that carry their own action: skeletons have nothing to add to yet,
+                and the error and empty states each own their one button. */}
+            {view === "list" && (
+              <div
+                ref={headerRef}
+                className="glass sticky top-0 z-10 -mx-6 mb-4 flex items-center justify-between gap-3 border-b border-[var(--color-border)] px-6 py-3"
+              >
+                <span className="text-[12.5px] tabular-nums text-[var(--color-faint)]">
+                  {shownLabel}
+                </span>
+                <Button size="sm" onClick={startAdd} icon={<PlusIcon className="h-3.5 w-3.5" />}>
+                  {TAB_META[tab].add}
+                </Button>
+              </div>
+            )}
+            {tab === "service" || tab === "product" ? (
+              <ItemsSection
+                tenantId={tenantId}
+                kind={tab}
+                cache={itemCache[tab]}
+                view={view}
+                everExtracted={everExtracted}
+                // Absent while the first load is in flight: assume "off" so the photo picker
+                // can't be clicked into a 503 before we know the server has storage at all.
+                storageEnabled={data?.storage_enabled ?? false}
+                editingId={editingId}
+                adding={adding}
+                extractBusy={extractBusy}
+                sentinelRef={setSentinel}
+                onEdit={setEditingId}
+                onStartAdd={startAdd}
+                onCloseEditor={closeEditor}
+                onSaved={handleItemSaved}
+                onDeleted={(id) => handleItemDeleted(tab, id)}
+                onPatched={handleItemPatched}
+                onToast={pushToast}
+                onExtract={onExtract}
+                onRetry={retryEntries}
+              />
+            ) : (
+              <SnippetsSection
+                tenantId={tenantId}
+                kind={tab}
+                cache={snippetCache[tab]}
+                view={view}
+                everExtracted={everExtracted}
+                editingId={editingId}
+                adding={adding}
+                extractBusy={extractBusy}
+                sentinelRef={setSentinel}
+                onEdit={setEditingId}
+                onStartAdd={startAdd}
+                onCloseEditor={closeEditor}
+                onSaved={handleSnippetSaved}
+                onDeleted={(id) => handleSnippetDeleted(tab, id)}
+                onExtract={onExtract}
+                onRetry={retryEntries}
+              />
+            )}
+          </>
         )}
       </div>
 
@@ -511,13 +791,14 @@ function Catalog({ tenantId, personaName }: { tenantId: string; personaName: str
 function ItemsSection({
   tenantId,
   kind,
-  items,
-  showSkeletons,
+  cache,
+  view,
   everExtracted,
   storageEnabled,
   editingId,
   adding,
   extractBusy,
+  sentinelRef,
   onEdit,
   onStartAdd,
   onCloseEditor,
@@ -526,16 +807,19 @@ function ItemsSection({
   onPatched,
   onToast,
   onExtract,
+  onRetry,
 }: {
   tenantId: string;
-  kind: ItemKind;
-  items: CatalogItem[];
-  showSkeletons: boolean;
+  kind: CatalogItemKind;
+  cache: PageCache<CatalogItem>;
+  view: PanelView;
   everExtracted: boolean;
   storageEnabled: boolean;
   editingId: string | null;
   adding: boolean;
   extractBusy: boolean;
+  /** Attaches the scroll sentinel; the parent observes whatever node it receives. */
+  sentinelRef: (node: HTMLDivElement | null) => void;
   onEdit: (id: string) => void;
   onStartAdd: () => void;
   onCloseEditor: () => void;
@@ -544,8 +828,9 @@ function ItemsSection({
   onPatched: (item: CatalogItem) => void;
   onToast: (kind: ToastItem["kind"], text: string) => void;
   onExtract: () => void;
+  onRetry: () => void;
 }) {
-  if (showSkeletons) {
+  if (view === "skeletons") {
     return (
       <div className="grid gap-4 lg:grid-cols-2" aria-busy>
         {[0, 1, 2, 3].map((i) => (
@@ -555,7 +840,11 @@ function ItemsSection({
     );
   }
 
-  if (items.length === 0 && !adding) {
+  if (view === "error") {
+    return <EntriesError kind={kind} error={cache.error} onRetry={onRetry} />;
+  }
+
+  if (view === "empty") {
     return (
       <Card className="animate-in">
         {everExtracted ? (
@@ -607,7 +896,22 @@ function ItemsSection({
 
   return (
     <div className="stagger grid items-start gap-4 lg:grid-cols-2">
-      {items.map((item) =>
+      {/* The blank editor opens at the TOP: with pages of rows below, the bottom of the
+          list isn't a place the reader can be assumed to be looking. */}
+      {adding && (
+        <ItemEditor
+          key="new"
+          tenantId={tenantId}
+          kind={kind}
+          storageEnabled={storageEnabled}
+          onCancel={onCloseEditor}
+          onSaved={onSaved}
+          onDeleted={onDeleted}
+          onPatched={onPatched}
+          onToast={onToast}
+        />
+      )}
+      {cache.rows.map((item) =>
         editingId === item.id ? (
           <ItemEditor
             key={item.id}
@@ -625,21 +929,13 @@ function ItemsSection({
           <ItemCard key={item.id} item={item} onEdit={() => onEdit(item.id)} />
         ),
       )}
-      {adding ? (
-        <ItemEditor
-          key="new"
-          tenantId={tenantId}
-          kind={kind}
-          storageEnabled={storageEnabled}
-          onCancel={onCloseEditor}
-          onSaved={onSaved}
-          onDeleted={onDeleted}
-          onPatched={onPatched}
-          onToast={onToast}
-        />
-      ) : (
-        <AddTile label={TAB_META[kind].add} onClick={onStartAdd} className="min-h-[140px]" />
-      )}
+      <PageSentinel
+        cache={cache}
+        kind={kind}
+        sentinelRef={sentinelRef}
+        onRetry={onRetry}
+        className="lg:col-span-2"
+      />
     </div>
   );
 }
@@ -734,7 +1030,7 @@ function ItemEditor({
   onToast,
 }: {
   tenantId: string;
-  kind: ItemKind;
+  kind: CatalogItemKind;
   item?: CatalogItem;
   storageEnabled: boolean;
   onCancel: () => void;
@@ -1188,35 +1484,40 @@ function PhotoField({
 function SnippetsSection({
   tenantId,
   kind,
-  snippets,
-  showSkeletons,
+  cache,
+  view,
   everExtracted,
   editingId,
   adding,
   extractBusy,
+  sentinelRef,
   onEdit,
   onStartAdd,
   onCloseEditor,
   onSaved,
   onDeleted,
   onExtract,
+  onRetry,
 }: {
   tenantId: string;
-  kind: SnippetKind;
-  snippets: CatalogSnippet[];
-  showSkeletons: boolean;
+  kind: CatalogSnippetKind;
+  cache: PageCache<CatalogSnippet>;
+  view: PanelView;
   everExtracted: boolean;
   editingId: string | null;
   adding: boolean;
   extractBusy: boolean;
+  /** Attaches the scroll sentinel; the parent observes whatever node it receives. */
+  sentinelRef: (node: HTMLDivElement | null) => void;
   onEdit: (id: string) => void;
   onStartAdd: () => void;
   onCloseEditor: () => void;
   onSaved: (snippet: CatalogSnippet, created: boolean) => void;
   onDeleted: (id: string) => void;
   onExtract: () => void;
+  onRetry: () => void;
 }) {
-  if (showSkeletons) {
+  if (view === "skeletons") {
     return (
       <div className="space-y-3" aria-busy>
         {[0, 1, 2].map((i) => (
@@ -1226,7 +1527,11 @@ function SnippetsSection({
     );
   }
 
-  if (snippets.length === 0 && !adding) {
+  if (view === "error") {
+    return <EntriesError kind={kind} error={cache.error} onRetry={onRetry} />;
+  }
+
+  if (view === "empty") {
     return (
       <Card className="animate-in">
         {everExtracted ? (
@@ -1278,7 +1583,18 @@ function SnippetsSection({
 
   return (
     <div className="stagger space-y-3">
-      {snippets.map((snippet) =>
+      {/* Top, not bottom — see ItemsSection. */}
+      {adding && (
+        <SnippetEditor
+          key="new"
+          tenantId={tenantId}
+          kind={kind}
+          onCancel={onCloseEditor}
+          onSaved={onSaved}
+          onDeleted={onDeleted}
+        />
+      )}
+      {cache.rows.map((snippet) =>
         editingId === snippet.id ? (
           <SnippetEditor
             key={snippet.id}
@@ -1293,18 +1609,7 @@ function SnippetsSection({
           <SnippetCard key={snippet.id} snippet={snippet} onEdit={() => onEdit(snippet.id)} />
         ),
       )}
-      {adding ? (
-        <SnippetEditor
-          key="new"
-          tenantId={tenantId}
-          kind={kind}
-          onCancel={onCloseEditor}
-          onSaved={onSaved}
-          onDeleted={onDeleted}
-        />
-      ) : (
-        <AddTile label={TAB_META[kind].add} onClick={onStartAdd} className="py-4" />
-      )}
+      <PageSentinel cache={cache} kind={kind} sentinelRef={sentinelRef} onRetry={onRetry} />
     </div>
   );
 }
@@ -1349,7 +1654,7 @@ function SnippetEditor({
   onDeleted,
 }: {
   tenantId: string;
-  kind: SnippetKind;
+  kind: CatalogSnippetKind;
   snippet?: CatalogSnippet;
   onCancel: () => void;
   onSaved: (snippet: CatalogSnippet, created: boolean) => void;
@@ -1488,23 +1793,78 @@ function SnippetEditor({
 /* StatusBadge, Field and errText live in ./parts — HoursPanel needs them too, and it
    can't import the page that renders it. */
 
-function AddTile({
-  label,
-  onClick,
+/** Tail of a paged list: the node the parent's IntersectionObserver watches, plus whatever
+ *  the current paging state has to say. It renders only while there IS a next page, so
+ *  reaching the end of the list says nothing at all — an "end of list" line would just be
+ *  noise on a list the reader already knows they've finished. */
+function PageSentinel({
+  cache,
+  kind,
+  sentinelRef,
+  onRetry,
   className = "",
 }: {
-  label: string;
-  onClick: () => void;
+  cache: PageCache<unknown>;
+  kind: EntryKind;
+  sentinelRef: (node: HTMLDivElement | null) => void;
+  onRetry: () => void;
   className?: string;
 }) {
+  if (cache.cursor === null) return null;
   return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={`flex w-full items-center justify-center gap-2 rounded-3xl border border-dashed border-[var(--color-border-strong)] bg-[var(--color-surface)]/50 px-4 py-6 text-[14px] font-semibold text-[var(--color-muted)] transition-all duration-200 hover:border-[var(--color-accent)] hover:bg-[var(--accent-wash)] hover:text-[var(--color-accent-ink)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring)] ${className}`}
+    <div
+      ref={sentinelRef}
+      className={`flex min-h-[3.5rem] items-center justify-center py-2 ${className}`}
+      aria-busy={cache.loading || undefined}
     >
-      <PlusIcon className="h-4 w-4" />
-      {label}
-    </button>
+      {cache.error ? (
+        <Button
+          variant="secondary"
+          size="sm"
+          onClick={onRetry}
+          icon={<RefreshIcon className="h-3.5 w-3.5" />}
+        >
+          Couldn’t load more — retry
+        </Button>
+      ) : cache.loading ? (
+        <span className="flex items-center gap-2 text-[var(--color-faint)]">
+          <Spinner className="h-4 w-4" />
+          <span className="sr-only">Loading more {TAB_META[kind].plural}</span>
+        </span>
+      ) : null}
+    </div>
+  );
+}
+
+/** The first page of a tab failed. Distinct from the whole-catalog failure above: the
+ *  metadata (and so the tabs, counts and extraction state) loaded fine — only these rows
+ *  didn't, so only these rows are worth retrying. */
+function EntriesError({
+  kind,
+  error,
+  onRetry,
+}: {
+  kind: EntryKind;
+  error: string | null;
+  onRetry: () => void;
+}) {
+  return (
+    <Card className="animate-in">
+      <EmptyState
+        icon={<AlertIcon className="h-7 w-7" />}
+        title={`Couldn’t load these ${TAB_META[kind].plural}`}
+        description={error ?? "Check your connection and try again."}
+        action={
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={onRetry}
+            icon={<RefreshIcon className="h-3.5 w-3.5" />}
+          >
+            Retry
+          </Button>
+        }
+      />
+    </Card>
   );
 }

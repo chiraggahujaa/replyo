@@ -1,7 +1,8 @@
 """Deterministic tests for the business-catalog pipeline's pure pieces.
 
-Covers `_merge` (dedupe + coalesce rules in app/extraction.py) and the prompt-block
-builders in app/catalog.py, plus the admin API request-model validation. All pure —
+Covers `_merge` (dedupe + coalesce rules in app/extraction.py), the prompt-block
+builders in app/catalog.py, the admin API request-model validation, and the keyset
+cursor/limit helpers behind GET /api/personas/active/catalog/entries. All pure —
 no network, no database, no LLM.
 
 Run:  uv run python scripts/test_catalog.py
@@ -188,12 +189,186 @@ def test_request_models():
           rejects(lambda: CreateSnippet(kind="guideline", title="T", body="b" * 5001)))
 
 
+def test_pagination_cursors():
+    print("\n\033[1m6) catalog entries — cursor + limit helpers\033[0m")
+    try:
+        from app.admin_api import (
+            ENTRIES_LIMIT_DEFAULT,
+            clamp_entries_limit,
+            decode_cursor,
+            encode_cursor,
+        )
+    except Exception as exc:  # pragma: no cover — env-dependent import, not a failure here
+        print(f"   SKIP admin_api not importable in this environment ({exc})")
+        return
+
+    # --- round-trip, both tuple shapes -------------------------------------------
+    item_key = [0, "restorative", "root canal", "6f1a3c2e-0000-4000-8000-000000000001"]
+    snippet_key = [3, "cancellation policy", "6f1a3c2e-0000-4000-8000-000000000002"]
+    check("item tuple round-trips", decode_cursor(encode_cursor(item_key)) == item_key)
+    check("snippet tuple round-trips", decode_cursor(encode_cursor(snippet_key)) == snippet_key)
+    check("cursor is url-safe (no +/= padding)",
+          not (set("+/=") & set(encode_cursor(item_key))), encode_cursor(item_key))
+
+    awkward = [
+        1, "", "6f1a3c2e-0000-4000-8000-000000000003",
+    ]
+    check("empty string survives", decode_cursor(encode_cursor(awkward)) == awkward)
+    for label, value in (
+        ("non-ASCII", "tratamiento de conducto — ñandú, 日本語"),
+        ("double quotes", 'the "premium" clean'),
+        ("single quote + backslash", "o'brien\\ back"),
+        ("newline + tab", "line1\nline2\tend"),
+        ("emoji", "whitening 🦷 kit"),
+    ):
+        key = [0, value, value, "6f1a3c2e-0000-4000-8000-000000000004"]
+        check(f"{label} survives the round-trip", decode_cursor(encode_cursor(key)) == key,
+              repr(decode_cursor(encode_cursor(key))))
+
+    # --- malformed cursors decode to None, never raise ---------------------------
+    import base64 as _b64
+    import json as _json
+
+    valid = encode_cursor(item_key)
+    malformed = {
+        "empty string": "",
+        "None": None,
+        "not base64 at all": "this is not base64!!",
+        "non-ASCII cursor": "ñot-båse64",
+        "base64 of non-JSON": _b64.urlsafe_b64encode(b"just text").decode().rstrip("="),
+        "base64 of a JSON object": _b64.urlsafe_b64encode(
+            _json.dumps({"k": 1}).encode()).decode().rstrip("="),
+        "base64 of a JSON scalar": _b64.urlsafe_b64encode(b"42").decode().rstrip("="),
+        "base64 of JSON null": _b64.urlsafe_b64encode(b"null").decode().rstrip("="),
+        "truncated cursor": valid[: len(valid) // 2],
+        "truncated by one char": valid[:-1],
+        "base64 of truncated JSON": _b64.urlsafe_b64encode(b'[0,"a"').decode().rstrip("="),
+        "base64 of invalid utf-8": _b64.urlsafe_b64encode(b"\xff\xfe[]").decode().rstrip("="),
+    }
+    for label, raw in malformed.items():
+        try:
+            result = decode_cursor(raw)
+            ok, detail = result is None, repr(result)
+        except Exception as exc:
+            ok, detail = False, f"raised {type(exc).__name__}: {exc}"
+        check(f"malformed ({label}) -> None, no raise", ok, detail)
+
+    # --- limit clamp --------------------------------------------------------------
+    check("default is 15", ENTRIES_LIMIT_DEFAULT == 15, str(ENTRIES_LIMIT_DEFAULT))
+    for value, expected in ((0, 1), (1, 1), (15, 15), (50, 50), (51, 50), (-7, 1), (10_000, 50)):
+        got = clamp_entries_limit(value)
+        check(f"limit {value} -> {expected}", got == expected, str(got))
+    for label, value in (("None", None), ("string", "20"), ("float", 12.5), ("bool", True)):
+        got = clamp_entries_limit(value)
+        check(f"non-int limit ({label}) -> default", got == ENTRIES_LIMIT_DEFAULT, str(got))
+
+
+def test_entries_route_shape():
+    print("\n\033[1m7) catalog entries — keyset wiring (table map + sort/filter agreement)\033[0m")
+    try:
+        from app.admin_api import _ENTRY_TABLE_FOR_KIND, _ENTRY_TABLES, get_catalog_entries
+    except Exception as exc:  # pragma: no cover — env-dependent import
+        print(f"   SKIP admin_api not importable in this environment ({exc})")
+        return
+
+    check("all four kinds map to a table",
+          sorted(_ENTRY_TABLE_FOR_KIND) == ["content", "guideline", "product", "service"])
+    check("service/product -> catalog_items",
+          {_ENTRY_TABLE_FOR_KIND["service"], _ENTRY_TABLE_FOR_KIND["product"]} == {"catalog_items"})
+    check("guideline/content -> business_snippets",
+          {_ENTRY_TABLE_FOR_KIND["guideline"], _ENTRY_TABLE_FOR_KIND["content"]}
+          == {"business_snippets"})
+
+    for table, spec in _ENTRY_TABLES.items():
+        # The keyset filter and the ORDER BY must be built from the same expressions, and
+        # the placeholder tuple must have exactly one slot per sort key.
+        check(f"{table}: row_value mirrors sort_sql",
+              spec["row_value"] == f"({spec['sort_sql']})", spec["row_value"])
+        check(f"{table}: one placeholder per key column",
+              spec["placeholders"].count("%s") == len(spec["key_columns"])
+              == len(spec["types"]), spec["placeholders"])
+        check(f"{table}: id is the last sort key", spec["key_columns"][-1] == "id")
+        check(f"{table}: id bound as uuid", spec["placeholders"].rstrip(")").endswith("::uuid"))
+
+    check("handler is registered on the router",
+          any(getattr(r, "endpoint", None) is get_catalog_entries
+              for r in __import__("app.admin_api", fromlist=["router"]).router.routes))
+
+
+def test_entries_page_assembly():
+    print("\n\033[1m8) catalog entries — page assembly (limit+1 -> entries, next_cursor)\033[0m")
+    try:
+        from app.admin_api import _ENTRY_TABLES, _entries_page, decode_cursor
+    except Exception as exc:  # pragma: no cover — env-dependent import
+        print(f"   SKIP admin_api not importable in this environment ({exc})")
+        return
+
+    import uuid as _uuid
+
+    keys = _ENTRY_TABLES["catalog_items"]["key_columns"]
+
+    def row(i, category="restorative"):
+        return {
+            "id": _uuid.UUID(f"6f1a3c2e-0000-4000-8000-{i:012d}"),
+            "kind": "service", "name": f"Service {i:03d}", "category": category,
+            "k1": 0 if category else 1, "k2": (category or ""), "k3": f"service {i:03d}",
+        }
+
+    entries, cursor = _entries_page([], 3, keys)
+    check("empty fetch -> no entries, no cursor", entries == [] and cursor is None)
+
+    entries, cursor = _entries_page([row(1), row(2)], 3, keys)
+    check("short page -> last page (cursor None)", len(entries) == 2 and cursor is None, str(cursor))
+
+    entries, cursor = _entries_page([row(i) for i in range(1, 4)], 3, keys)
+    check("exactly `limit` rows -> still the last page", len(entries) == 3 and cursor is None,
+          str(cursor))
+
+    fetched = [row(i) for i in range(1, 5)]  # limit+1
+    entries, cursor = _entries_page(fetched, 3, keys)
+    check("limit+1 rows -> extra dropped", len(entries) == 3, str(len(entries)))
+    check("cursor present when more remain", cursor is not None)
+    check("cursor names the LAST KEPT row (not the extra)",
+          decode_cursor(cursor) == [0, "restorative", "service 003",
+                                    "6f1a3c2e-0000-4000-8000-000000000003"],
+          str(decode_cursor(cursor)))
+    check("uuid id is stringified for JSON", isinstance((decode_cursor(cursor) or [])[-1], str))
+    check("helper key columns stripped from the payload",
+          all(not ({"k1", "k2", "k3"} & set(e)) for e in entries), str(sorted(entries[0])))
+    check("every real column survives",
+          sorted(entries[0]) == ["category", "id", "kind", "name"], str(sorted(entries[0])))
+
+    # A null category sorts last, and its cursor carries the flag + the '' collapse.
+    entries, cursor = _entries_page([row(i, None) for i in range(1, 3)], 1, keys)
+    check("null-category cursor keeps flag=1 and empty category",
+          decode_cursor(cursor) == [1, "", "service 001",
+                                   "6f1a3c2e-0000-4000-8000-000000000001"],
+          str(decode_cursor(cursor)))
+
+    skeys = _ENTRY_TABLES["business_snippets"]["key_columns"]
+    srows = [
+        {"id": _uuid.UUID("6f1a3c2e-0000-4000-8000-000000000009"), "kind": "content",
+         "title": "Location", "body": "b", "sort": 2, "k2": "location"},
+        {"id": _uuid.UUID("6f1a3c2e-0000-4000-8000-000000000010"), "kind": "content",
+         "title": "Parking", "body": "b", "sort": 3, "k2": "parking"},
+    ]
+    entries, cursor = _entries_page(srows, 1, skeys)
+    check("snippet cursor is (sort, lower(title), id)",
+          decode_cursor(cursor) == [2, "location", "6f1a3c2e-0000-4000-8000-000000000009"],
+          str(decode_cursor(cursor)))
+    check("snippet payload keeps its columns, drops k2",
+          sorted(entries[0]) == ["body", "id", "kind", "sort", "title"], str(sorted(entries[0])))
+
+
 def main():
     test_merge_items()
     test_merge_snippets()
     test_catalog_block()
     test_guidelines_block()
     test_request_models()
+    test_pagination_cursors()
+    test_entries_route_shape()
+    test_entries_page_assembly()
     print("\n" + "=" * 56)
     if FAILURES:
         print(f"  {len(FAILURES)} FAILURES: {FAILURES}")

@@ -133,9 +133,20 @@ export async function uploadDocument(tenantId: string, file: File): Promise<Know
 
 // ---- catalog ----
 
+/** The two row shapes the catalog stores, split by which table they live in. `EntryKind`
+ *  is the union both the counts payload and the paged entries endpoint are keyed by — the
+ *  single definition of "one of the four list tabs". */
+export type CatalogItemKind = "service" | "product";
+export type CatalogSnippetKind = "guideline" | "content";
+export type EntryKind = CatalogItemKind | CatalogSnippetKind;
+
+/** Row totals per kind, straight from the server. The console's tab badges read these
+ *  rather than counting loaded rows, because only one page of one tab is ever loaded. */
+export type CatalogCounts = Record<EntryKind, number>;
+
 export type CatalogItem = {
   id: string;
-  kind: "service" | "product";
+  kind: CatalogItemKind;
   name: string;
   description: string | null;
   price_text: string | null;
@@ -153,7 +164,7 @@ export type CatalogItem = {
 
 export type CatalogSnippet = {
   id: string;
-  kind: "guideline" | "content";
+  kind: CatalogSnippetKind;
   title: string;
   body: string;
   source: string | null;
@@ -187,9 +198,11 @@ export type CatalogSettingsInput = {
   buffer_minutes?: number;
 };
 
+/** Catalog metadata — deliberately row-free. Rows come a page at a time from
+ *  `listCatalogItems` / `listCatalogSnippets`, so this stays cheap enough to poll every
+ *  few seconds while an extraction runs. */
 export type CatalogResponse = {
-  items: CatalogItem[];
-  snippets: CatalogSnippet[];
+  counts: CatalogCounts;
   extraction: {
     status: "idle" | "running" | "done" | "error";
     error: string | null;
@@ -204,7 +217,7 @@ export type CatalogResponse = {
 
 /** Writable item fields; PATCH sends any subset, POST requires kind + name. */
 export type CatalogItemInput = {
-  kind: "service" | "product";
+  kind: CatalogItemKind;
   name: string;
   description?: string | null;
   price_text?: string | null;
@@ -215,13 +228,42 @@ export type CatalogItemInput = {
 };
 
 export type CatalogSnippetInput = {
-  kind: "guideline" | "content";
+  kind: CatalogSnippetKind;
   title: string;
   body: string;
 };
 
+/** One page of rows. `next_cursor === null` means the list is exhausted, so a caller never
+ *  has to spend a request discovering there's nothing left. */
+export type CatalogPage<T> = { entries: T[]; next_cursor: string | null };
+
+export type CatalogPageOpts = { limit?: number; cursor?: string };
+
+/** `cursor` is opaque — it goes back to the server verbatim, never parsed. */
+function entriesPath(kind: EntryKind, opts?: CatalogPageOpts): string {
+  const q = new URLSearchParams({ kind });
+  if (opts?.limit !== undefined) q.set("limit", String(opts.limit));
+  if (opts?.cursor) q.set("cursor", opts.cursor);
+  return `/api/personas/active/catalog/entries?${q.toString()}`;
+}
+
 export const getCatalog = (tenantId: string) =>
   req<CatalogResponse>("/api/personas/active/catalog", { tenantId });
+
+/* Two typed views of the one /entries endpoint. Splitting them by row shape is what keeps
+   every call site free of casts: the kind you ask for decides the type you get back. */
+
+export const listCatalogItems = (
+  tenantId: string,
+  kind: CatalogItemKind,
+  opts?: CatalogPageOpts,
+) => req<CatalogPage<CatalogItem>>(entriesPath(kind, opts), { tenantId });
+
+export const listCatalogSnippets = (
+  tenantId: string,
+  kind: CatalogSnippetKind,
+  opts?: CatalogPageOpts,
+) => req<CatalogPage<CatalogSnippet>>(entriesPath(kind, opts), { tenantId });
 export const createCatalogItem = (tenantId: string, body: CatalogItemInput) =>
   req<CatalogItem>("/api/personas/active/catalog/items", {
     method: "POST",

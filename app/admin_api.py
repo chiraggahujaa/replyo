@@ -11,11 +11,14 @@ only as the fallback.
 
 from __future__ import annotations
 
+import base64
+import json
 import logging
+import uuid
 from typing import Literal
 
 import psycopg.errors
-from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, UploadFile
 from psycopg.types.json import Jsonb
 from pydantic import BaseModel, Field, field_validator
 
@@ -373,9 +376,145 @@ async def delete_knowledge(source_id: str, tenant: dict = Depends(_require_tenan
 # business catalog (structured extraction — app/extraction.py writes, this reviews)
 # ---------------------------------------------------------------------------
 
+ENTRY_KINDS = ("service", "product", "guideline", "content")
+EntryKind = Literal["service", "product", "guideline", "content"]
+
+# How many rows one scroll page carries, and the ceiling a caller may ask for. 15 is a
+# screenful in the console's list; the ceiling stops a client turning "page" back into
+# "load everything" (the whole point of this endpoint).
+ENTRIES_LIMIT_DEFAULT = 15
+ENTRIES_LIMIT_MAX = 50
+
+# Per-table keyset recipe. `sort_sql`/`row_value` must stay character-identical in
+# spirit: the ORDER BY and the WHERE comparison are built from the SAME expressions, so
+# the tuple ordering and the filter can never drift apart. `extra` re-selects those
+# expressions as columns (k1/k2/k3) so the cursor is built from values POSTGRES
+# computed — Python's str.lower() and Postgres' lower() need not agree on every
+# codepoint/collation, and a cursor built from the wrong one would skip or repeat rows.
+# `key_columns` is the cursor tuple in ORDER BY order; `types` validates a decoded one.
+_ENTRY_TABLES: dict[str, dict] = {
+    "catalog_items": {
+        "extra": "(category is null)::int as k1, coalesce(lower(category), '') as k2, "
+                 "lower(name) as k3",
+        "sort_sql": "(category is null)::int, coalesce(lower(category), ''), lower(name), id",
+        "row_value": "((category is null)::int, coalesce(lower(category), ''), lower(name), id)",
+        "placeholders": "(%s::int, %s, %s, %s::uuid)",
+        "key_columns": ("k1", "k2", "k3", "id"),
+        "types": (int, str, str, str),
+    },
+    "business_snippets": {
+        "extra": "lower(title) as k2",
+        "sort_sql": "sort, lower(title), id",
+        "row_value": "(sort, lower(title), id)",
+        "placeholders": "(%s::int, %s, %s::uuid)",
+        "key_columns": ("sort", "k2", "id"),
+        "types": (int, str, str),
+    },
+}
+# service/product live in catalog_items, guideline/content in business_snippets.
+_ENTRY_TABLE_FOR_KIND = {
+    "service": "catalog_items", "product": "catalog_items",
+    "guideline": "business_snippets", "content": "business_snippets",
+}
+# The k1/k2/k3 helper columns exist only to build the cursor — they are stripped before
+# the row is serialized, so an entry looks exactly like the CRUD endpoints' rows.
+_ENTRY_HELPER_COLUMNS = frozenset({"k1", "k2", "k3"})
+
+
+def encode_cursor(values: list) -> str:
+    """A page cursor: base64url(compact JSON of the last row's sort tuple), unpadded.
+
+    JSON because the tuple mixes ints and text (and text can contain anything a name or
+    title can); base64url because it travels in a query string; unpadded because '=' in
+    a URL is noise. Opaque by intent — the console only ever echoes it back.
+    """
+    raw = json.dumps(values, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def decode_cursor(raw: str | None) -> list | None:
+    """The sort tuple inside a cursor, or None if it isn't one.
+
+    POLICY: an absent, truncated, non-base64, non-JSON or non-list cursor decodes to
+    None and the caller starts from the beginning. Never an exception, never a 500, and
+    deliberately not a 400 either: a cursor is a transient scroll position, and the only
+    ways to get a bad one are a stale bookmark or a hand-edited URL — restarting the
+    list is a strictly better answer there than an error the console has to render.
+    """
+    if not raw:
+        return None
+    try:
+        padded = raw + "=" * (-len(raw) % 4)
+        values = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")))
+    except Exception:
+        return None
+    return values if isinstance(values, list) else None
+
+
+def clamp_entries_limit(limit: object) -> int:
+    """A page size inside 1..ENTRIES_LIMIT_MAX; anything unusable becomes the default.
+
+    Clamped rather than rejected: `limit` is a display detail, so an out-of-range value
+    should still return a usable page instead of a 422 that empties the console's list.
+    """
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        return ENTRIES_LIMIT_DEFAULT
+    return max(1, min(ENTRIES_LIMIT_MAX, limit))
+
+
+def _entries_page(
+    rows: list[dict], limit: int, key_columns: tuple[str, ...]
+) -> tuple[list[dict], str | None]:
+    """Turn a limit+1 fetch into (entries, next_cursor) — the whole "is there more?" rule.
+
+    Reading one row past the page is how `next_cursor` can be null EXACTLY when the list
+    is exhausted: getting the extra row is proof another page exists, so the console
+    never has to spend a request that comes back empty. The cursor is built from the last
+    KEPT row (not the extra one), which is the last row the client will have seen.
+    """
+    kept = rows[:limit]
+    next_cursor = None
+    if len(rows) > limit and kept:
+        last = kept[-1]
+        next_cursor = encode_cursor([
+            # The id is the only non-JSON-primitive in either tuple (psycopg hands back
+            # a uuid.UUID); everything else is already an int or str.
+            str(last[col]) if col == "id" else last[col]
+            for col in key_columns
+        ])
+    entries = [{k: v for k, v in row.items() if k not in _ENTRY_HELPER_COLUMNS} for row in kept]
+    return entries, next_cursor
+
+
+def _cursor_params(raw: str | None, spec: dict) -> list | None:
+    """A decoded cursor validated against this table's tuple shape, else None.
+
+    Shape-checking here is what keeps a mismatched cursor (a snippet cursor replayed on
+    an items query, say) from reaching Postgres as a type error: wrong length, wrong
+    element type or a non-UUID id all mean "not a cursor for this list" -> start over.
+    """
+    values = decode_cursor(raw)
+    types: tuple[type, ...] = spec["types"]
+    if values is None or len(values) != len(types):
+        return None
+    for value, expected in zip(values, types, strict=True):
+        if isinstance(value, bool) or not isinstance(value, expected):
+            return None
+    try:
+        uuid.UUID(str(values[-1]))  # the id tie-breaker is bound as ::uuid
+    except (ValueError, AttributeError, TypeError):
+        return None
+    return list(values)
+
+
 @router.get("/personas/active/catalog")
 async def get_catalog(tenant: dict = Depends(_require_tenant)) -> dict:
-    """Everything the catalog console shows: items, snippets, and the extraction state.
+    """Catalog METADATA only — per-tab counts, extraction state, settings. No rows.
+
+    The rows come from /catalog/entries a page at a time; a real persona already has
+    tens of services and notes, and shipping all of them (with descriptions) on every
+    console load is a payload that only grows. Two grouped aggregates give the tab
+    badges their numbers for the price of an index scan.
 
     A tenant that has never extracted has no business_profiles row yet — that's the
     'idle' state, not an error. A 'running' left behind by a process that died mid-run
@@ -385,22 +524,25 @@ async def get_catalog(tenant: dict = Depends(_require_tenant)) -> dict:
     tid = str(tenant["id"])
     await extraction.reset_stale_run(tid)
     async with await scoped_connection(tenant_id=tid) as conn:
-        items = await (await conn.execute(
-            "select * from catalog_items where tenant_id = %s "
-            "order by kind, category nulls last, lower(name)",
+        item_counts = await (await conn.execute(
+            "select kind, count(*) as n from catalog_items where tenant_id = %s group by kind",
             (tid,),
         )).fetchall()
-        snippets = await (await conn.execute(
-            "select * from business_snippets where tenant_id = %s "
-            "order by kind, sort, lower(title)",
+        snippet_counts = await (await conn.execute(
+            "select kind, count(*) as n from business_snippets where tenant_id = %s group by kind",
             (tid,),
         )).fetchall()
         profile = await (await conn.execute(
             "select * from business_profiles where tenant_id = %s", (tid,)
         )).fetchone()
+    # Every kind is always present (0 when the tenant has none of it), so the console
+    # renders four tabs from one shape instead of guarding each lookup.
+    counts = dict.fromkeys(ENTRY_KINDS, 0)
+    for row in (*item_counts, *snippet_counts):
+        if row["kind"] in counts:
+            counts[row["kind"]] = int(row["n"])
     return {
-        "items": items,
-        "snippets": snippets,
+        "counts": counts,
         "extraction": {
             "status": profile["extraction_status"] if profile else "idle",
             "error": profile["extraction_error"] if profile else None,
@@ -419,6 +561,64 @@ async def get_catalog(tenant: dict = Depends(_require_tenant)) -> dict:
         # the picker with an explanation instead of showing a 503 after a 5 MB upload.
         "storage_enabled": settings.storage_enabled,
     }
+
+
+@router.get("/personas/active/catalog/entries")
+async def get_catalog_entries(
+    kind: EntryKind,
+    limit: int = Query(
+        ENTRIES_LIMIT_DEFAULT,
+        description=f"Rows per page, clamped to 1..{ENTRIES_LIMIT_MAX}.",
+    ),
+    cursor: str | None = Query(
+        None, description="`next_cursor` from the previous page; omit for the first page."
+    ),
+    tenant: dict = Depends(_require_tenant),
+) -> dict:
+    """One page of catalog rows for a single tab: {entries, next_cursor}.
+
+    Ordered exactly as app/catalog.py feeds the agent — items by category (unset last)
+    then name, snippets by sort then title, each with the row id as the tie-breaker that
+    makes the order total (a keyset needs a unique last column, and two rows CAN share a
+    name-and-category). So the owner reads the catalog in the order the assistant does.
+
+    KEYSET, not OFFSET, and that's the point: an extraction run can be inserting rows in
+    the background while the owner scrolls. With OFFSET, a row inserted above the window
+    pushes everything down, so page 2 re-shows the last row of page 1 (or, on delete,
+    skips a row entirely). A cursor names the last row the client actually saw, so the
+    next page continues from THERE regardless of what changed above it.
+
+    The cursor is the row's sort tuple, compared as a whole with a row-value `>` against
+    the very same expressions the ORDER BY uses — one source of truth for "after this
+    row", so the ordering and the filter cannot disagree. We fetch limit+1 rows and drop
+    the extra: getting it proves another page exists, so `next_cursor` is null exactly
+    when the list is exhausted and the console never spends a request to learn that.
+
+    Rows are serialized exactly as the item/snippet CRUD endpoints return them (all
+    columns), so the console's types are unchanged. A bad `kind` is a 422; an
+    unintelligible `cursor` restarts the list (see decode_cursor).
+    """
+    tid = str(tenant["id"])
+    table = _ENTRY_TABLE_FOR_KIND[kind]
+    spec = _ENTRY_TABLES[table]
+    page = clamp_entries_limit(limit)
+    after = _cursor_params(cursor, spec)
+
+    # Interpolated: only this module's own table name and its fixed sort expressions
+    # (chosen by the validated `kind`). Every value — tenant, kind, cursor, limit — is
+    # parameter-bound.
+    keyset = f"and {spec['row_value']} > {spec['placeholders']}" if after else ""
+    sql = (
+        f"select *, {spec['extra']} from {table} "
+        f"where tenant_id = %s and kind = %s {keyset} "
+        f"order by {spec['sort_sql']} limit %s"
+    )
+    params = [tid, kind, *(after or []), page + 1]  # +1: the row that proves there's more
+    async with await scoped_connection(tenant_id=tid) as conn:
+        rows = await (await conn.execute(sql, params)).fetchall()  # pyright: ignore[reportArgumentType]
+
+    entries, next_cursor = _entries_page(rows, page, spec["key_columns"])
+    return {"entries": entries, "next_cursor": next_cursor}
 
 
 @router.patch("/personas/active/catalog/settings")
