@@ -19,6 +19,8 @@ import {
   type CatalogItem,
   type CatalogItemInput,
   type CatalogItemKind,
+  // Aliased: this module's default export is already called CatalogPage.
+  type CatalogPage as EntriesPage,
   type CatalogResponse,
   type CatalogSettings,
   type CatalogSnippet,
@@ -168,19 +170,26 @@ const staleCache = <T,>(c: PageCache<T>): PageCache<T> => ({
   error: null,
 });
 
-/** Fold a fetched page in. The first page replaces (that's the refetch path); later pages
- *  append, skipping ids already held so a row created locally — or an overlap at a page
- *  boundary — can never produce two cards with the same key. */
+/** Fold a fetched page in. The first page (`requested === null`) replaces — that's the
+ *  refetch-after-extraction path; later pages append, skipping ids already held so a row
+ *  created locally, or an overlap at a page boundary, can never produce two cards with the
+ *  same key. */
 function applyPage<T extends { id: string }>(
   prev: PageCache<T>,
-  entries: T[],
-  next: string | null,
-  first: boolean,
+  page: EntriesPage<T>,
+  requested: string | null,
 ): PageCache<T> {
+  const first = requested === null;
   const seen = new Set(prev.rows.map((r) => r.id));
+  const added = first ? page.entries : page.entries.filter((e) => !seen.has(e.id));
+  // next_cursor === null is the contract's only terminator, but a cursor that didn't
+  // advance, or a page that added nothing, would have the sentinel asking forever — so
+  // treat those as the end too rather than letting a server bug become a request loop.
+  const done =
+    page.next_cursor === null || page.next_cursor === requested || (!first && added.length === 0);
   return {
-    rows: first ? entries : [...prev.rows, ...entries.filter((e) => !seen.has(e.id))],
-    cursor: next,
+    rows: first ? page.entries : [...prev.rows, ...added],
+    cursor: done ? null : page.next_cursor,
     loading: false,
     loaded: true,
     error: null,
@@ -301,23 +310,24 @@ function Catalog({ tenantId, personaName }: { tenantId: string; personaName: str
       if (inflight.current.has(key)) return;
       inflight.current.add(key);
       const gen = genRef.current;
-      const first = cursor === null;
       const opts = { limit: PAGE_SIZE, cursor: cursor ?? undefined };
       try {
         if (kind === "service" || kind === "product") {
           updateItems(kind, (c) => ({ ...c, loading: true, error: null }));
           const page = await listCatalogItems(tenantId, kind, opts);
           if (genRef.current !== gen) return;
-          updateItems(kind, (c) => applyPage(c, page.entries, page.next_cursor, first));
+          updateItems(kind, (c) => applyPage(c, page, cursor));
         } else {
           updateSnippets(kind, (c) => ({ ...c, loading: true, error: null }));
           const page = await listCatalogSnippets(tenantId, kind, opts);
           if (genRef.current !== gen) return;
-          updateSnippets(kind, (c) => applyPage(c, page.entries, page.next_cursor, first));
+          updateSnippets(kind, (c) => applyPage(c, page, cursor));
         }
       } catch (e) {
         if (genRef.current !== gen) return;
-        const msg = errText(e, "Couldn’t load these rows");
+        // Phrased as a description, because that's where it surfaces: under the error
+        // card's own title. The retry-in-the-sentinel case shows a button, not this.
+        const msg = errText(e, "Check your connection and try again.");
         if (kind === "service" || kind === "product")
           updateItems(kind, (c) => ({ ...c, loading: false, error: msg }));
         else updateSnippets(kind, (c) => ({ ...c, loading: false, error: msg }));
@@ -675,7 +685,7 @@ function Catalog({ tenantId, personaName }: { tenantId: string; personaName: str
         <Tabs tabs={tabs} value={tab} onChange={selectTab} />
       </div>
 
-      <div className="mt-6">
+      <div ref={panelRef} className="mt-6">
         {loadFailed ? (
           <Card className="animate-in">
             <EmptyState
@@ -721,10 +731,7 @@ function Catalog({ tenantId, personaName }: { tenantId: string; personaName: str
                 bodies that carry their own action: skeletons have nothing to add to yet,
                 and the error and empty states each own their one button. */}
             {view === "list" && (
-              <div
-                ref={headerRef}
-                className="glass sticky top-0 z-10 -mx-6 mb-4 flex items-center justify-between gap-3 border-b border-[var(--color-border)] px-6 py-3"
-              >
+              <div className="glass sticky top-0 z-10 -mx-6 mb-4 flex items-center justify-between gap-3 border-b border-[var(--color-border)] px-6 py-3">
                 <span className="text-[12.5px] tabular-nums text-[var(--color-faint)]">
                   {shownLabel}
                 </span>
