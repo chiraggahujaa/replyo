@@ -10,7 +10,7 @@ import { useEffect, useRef, useState } from "react";
 import { API_BASE, updatePersona } from "@/lib/api";
 import { Shell } from "../components/Shell";
 import { useReplyo } from "../providers";
-import { Badge, Button, Card, EmptyState, PageHeader, TextInput } from "../components/ui";
+import { Badge, Button, Card, EmptyState, PageHeader, Spinner, TextInput } from "../components/ui";
 import {
   CheckIcon,
   CodeIcon,
@@ -246,7 +246,7 @@ export default function InstallPage() {
 }
 
 function Install() {
-  const { active, refreshPersonas } = useReplyo();
+  const { active, personasLoading, refreshPersonas } = useReplyo();
   const [copied, setCopied] = useState(false);
   // Edits made in this mount (plus live cross-tab writes, merged by the storage
   // listener). Deliberately NOT seeded from localStorage: the server config is
@@ -348,6 +348,14 @@ function Install() {
   }, []);
 
   if (!active || !value) {
+    if (!active && personasLoading) {
+      return (
+        <div className="flex flex-1 flex-col items-center justify-center py-24 text-[var(--color-faint)]">
+          <Spinner className="h-5 w-5" />
+          <span className="sr-only">Loading personas</span>
+        </div>
+      );
+    }
     return (
       <div className="mx-auto w-full max-w-2xl px-6 py-8">
         <EmptyState

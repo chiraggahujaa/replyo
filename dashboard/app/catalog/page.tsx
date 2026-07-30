@@ -13,7 +13,7 @@
 // fetches its own rows PAGE_SIZE at a time, the first page on first visit and the rest
 // as the reader scrolls. Switching to Services never downloads Products.
 
-import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import {
   type CatalogCounts,
   type CatalogItem,
@@ -210,8 +210,18 @@ export default function CatalogPage() {
 
 // Remount on persona switch so all state (data, tab, editors, timers) resets cleanly.
 function CatalogForActive() {
-  const { active } = useReplyo();
+  const { active, personasLoading } = useReplyo();
   if (!active) {
+    // First-ever visit with a cold cache: the personas request is still out, so
+    // "select a persona" would be premature — nothing exists to select yet.
+    if (personasLoading) {
+    return (
+      <div className="flex flex-1 flex-col items-center justify-center py-24 text-[var(--color-faint)]">
+        <Spinner className="h-5 w-5" />
+        <span className="sr-only">Loading personas</span>
+      </div>
+    );
+    }
     return (
       <div className="flex flex-1 flex-col items-center justify-center">
         <EmptyState
@@ -260,6 +270,18 @@ function Catalog({ tenantId, personaName }: { tenantId: string; personaName: str
   // The element observed to trigger the next page. Held in state (not a ref) so the
   // observer effect re-runs the moment it mounts, remounts or unmounts.
   const [sentinel, setSentinel] = useState<HTMLDivElement | null>(null);
+  // Whether the toolbar is pinned to the top of the scroll pane right now — drives its
+  // chrome (glass/border/shadow only while overlaying content). See the guard element
+  // rendered just above the toolbar.
+  const [stuck, setStuck] = useState(false);
+  const stuckGuardRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const guard = stuckGuardRef.current;
+    if (!guard) return;
+    const io = new IntersectionObserver(([entry]) => setStuck(!entry.isIntersecting));
+    io.observe(guard);
+    return () => io.disconnect();
+  }, []);
   // The panel wrapper, NOT the sticky header inside it: a pinned sticky element already
   // reports itself as being at the top of the scrollport, so scrollIntoView on it does
   // nothing. Its non-sticky container is the thing that actually scrolls back into place.
@@ -510,10 +532,20 @@ function Catalog({ tenantId, personaName }: { tenantId: string; personaName: str
     }
   };
 
-  /** Put the top of the tab panel back at the top of the scroll pane. In an rAF so it runs
-   *  against the DOM the state change produced, not the one it replaced. */
+  /** Put the top of the tab panel back in view — but only when it actually isn't. The
+   *  panel's scroll-mt matches the sticky toolbar's height, so "in view" means just below
+   *  the toolbar, not underneath it (scrollIntoView alone landed every tab switch a
+   *  toolbar-height too deep, which read as "already scrolled"). When the reader is at or
+   *  above that line — e.g. sitting at the top of the page — switching tabs must not move
+   *  the viewport at all. In an rAF so it measures the DOM the state change produced. */
   const scrollPanelToTop = (behavior: ScrollBehavior) =>
-    requestAnimationFrame(() => panelRef.current?.scrollIntoView({ behavior, block: "start" }));
+    requestAnimationFrame(() => {
+      const el = panelRef.current;
+      // 64 = the toolbar's height, the same value as the panel's scroll-mt-16.
+      if (el && el.getBoundingClientRect().top < 64) {
+        el.scrollIntoView({ behavior, block: "start" });
+      }
+    });
 
   const selectTab = (key: string) => {
     setTab(key as TabKey);
@@ -628,15 +660,6 @@ function Catalog({ tenantId, personaName }: { tenantId: string; personaName: str
         : activeCache?.error
           ? "error"
           : "empty";
-  // The list's own footnote: infinite scroll means "27" in the tab badge and what's on
-  // screen are different numbers, so say both while they differ.
-  const shownLabel =
-    active !== null && counts && counts[active] > 0
-      ? rowCount < counts[active]
-        ? `Showing ${rowCount} of ${counts[active]}`
-        : `${counts[active]} ${TAB_META[active].plural}`
-      : null;
-
   return (
     <div className="animate-in mx-auto w-full max-w-5xl px-6 py-8">
       <PageHeader
@@ -681,11 +704,38 @@ function Catalog({ tenantId, personaName }: { tenantId: string; personaName: str
         }
       />
 
-      <div className="mt-7">
+      {/* One toolbar: the tabs and the tab's Add action on the same sticky row. Add used to
+          sit in a band of its own below this, which was mostly empty space restating the
+          count already on the tab badge. Sticky so both stay reachable however far down a
+          paged list the reader is.
+
+          The band chrome (glass + border + shadow) appears only while actually PINNED —
+          at rest the row sits directly on the page like every other section, because a
+          full-width bordered rectangle wrapping the pill bar read as exactly that: a
+          rectangle. CSS can't observe "position: sticky is currently stuck", so a 1px
+          guard right above it does: the guard scrolling out of the viewport IS the moment
+          the row pins. Full-bleed (-mx-6/px-6 against the page's px-6) so the blur covers
+          the rows passing underneath edge to edge. */}
+      <div ref={stuckGuardRef} aria-hidden className="mt-7 h-px" />
+      <div
+        className={`sticky top-0 z-20 -mx-6 flex flex-wrap items-center justify-between gap-3 border-b px-6 py-3 transition-[border-color,box-shadow] duration-200 ${
+          stuck
+            ? "glass border-[var(--color-border)] shadow-[0_10px_28px_-18px_rgb(0_0_0/0.35)]"
+            : "border-transparent"
+        }`}
+      >
         <Tabs tabs={tabs} value={tab} onChange={selectTab} />
+        {/* Hidden for the bodies that own their own action (the empty and error states each
+            have one button, and skeletons have nothing to add to yet), so there is never
+            a second competing Add on screen. */}
+        {active !== null && view === "list" && (
+          <Button size="sm" onClick={startAdd} icon={<PlusIcon className="h-3.5 w-3.5" />}>
+            {TAB_META[active].add}
+          </Button>
+        )}
       </div>
 
-      <div ref={panelRef} className="mt-6">
+      <div ref={panelRef} className="mt-6 scroll-mt-16">
         {loadFailed ? (
           <Card className="animate-in">
             <EmptyState
@@ -725,26 +775,12 @@ function Catalog({ tenantId, personaName }: { tenantId: string; personaName: str
           )
         ) : (
           <>
-            {/* The tab panel's header row — where Add lives now that the end of a list is
-                pages away. Sticky (same idiom as the review queue's header) so it stays
-                reachable however far down the reader has scrolled. Hidden for the three
-                bodies that carry their own action: skeletons have nothing to add to yet,
-                and the error and empty states each own their one button. */}
-            {view === "list" && (
-              <div className="glass sticky top-0 z-10 -mx-6 mb-4 flex items-center justify-between gap-3 border-b border-[var(--color-border)] px-6 py-3">
-                <span className="text-[12.5px] tabular-nums text-[var(--color-faint)]">
-                  {shownLabel}
-                </span>
-                <Button size="sm" onClick={startAdd} icon={<PlusIcon className="h-3.5 w-3.5" />}>
-                  {TAB_META[tab].add}
-                </Button>
-              </div>
-            )}
             {tab === "service" || tab === "product" ? (
               <ItemsSection
                 tenantId={tenantId}
                 kind={tab}
                 cache={itemCache[tab]}
+                total={counts?.[tab] ?? 0}
                 view={view}
                 everExtracted={everExtracted}
                 // Absent while the first load is in flight: assume "off" so the photo picker
@@ -769,6 +805,7 @@ function Catalog({ tenantId, personaName }: { tenantId: string; personaName: str
                 tenantId={tenantId}
                 kind={tab}
                 cache={snippetCache[tab]}
+                total={counts?.[tab] ?? 0}
                 view={view}
                 everExtracted={everExtracted}
                 editingId={editingId}
@@ -799,6 +836,7 @@ function ItemsSection({
   tenantId,
   kind,
   cache,
+  total,
   view,
   everExtracted,
   storageEnabled,
@@ -819,6 +857,8 @@ function ItemsSection({
   tenantId: string;
   kind: CatalogItemKind;
   cache: PageCache<CatalogItem>;
+  /** This tab's server-side total, for the "Showing N of M" footnote. */
+  total: number;
   view: PanelView;
   everExtracted: boolean;
   storageEnabled: boolean;
@@ -939,6 +979,7 @@ function ItemsSection({
       <PageSentinel
         cache={cache}
         kind={kind}
+        total={total}
         sentinelRef={sentinelRef}
         onRetry={onRetry}
         className="lg:col-span-2"
@@ -1065,6 +1106,9 @@ function ItemEditor({
   const [duration, setDuration] = useState(item?.duration_min != null ? String(item.duration_min) : "");
   const [category, setCategory] = useState(item?.category ?? "");
   const [description, setDescription] = useState(item?.description ?? "");
+  // Add-mode only: a photo picked before the row exists. Save creates the product first,
+  // then uploads this — the row id the image endpoint needs simply doesn't exist earlier.
+  const [stagedPhoto, setStagedPhoto] = useState<File | null>(null);
   const [busy, setBusy] = useState<"save" | "delete" | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [confirmDel, setConfirmDel] = useState(false);
@@ -1146,7 +1190,24 @@ function ItemEditor({
         if (kind === "service" && dur !== null) body.duration_min = dur;
         if (category.trim()) body.category = category.trim();
         if (description.trim()) body.description = description.trim();
-        onSaved(await createCatalogItem(tenantId, body), true);
+        const created = await createCatalogItem(tenantId, body);
+        // A staged photo uploads right after the row exists (its id is the upload path).
+        // The two outcomes are reported separately: the product is real either way, so a
+        // failed photo must not read as a failed product — the row lands in the list and
+        // the toast says exactly which half went wrong.
+        if (stagedPhoto) {
+          try {
+            onSaved(await uploadCatalogImage(tenantId, created.id, stagedPhoto), true);
+          } catch (photoErr) {
+            onSaved(created, true);
+            onToast(
+              "error",
+              `The product was added, but its photo didn’t upload — ${errText(photoErr, "open it to retry")}`,
+            );
+          }
+        } else {
+          onSaved(created, true);
+        }
       }
     } catch (e) {
       setErr(errText(e, "Couldn't save"));
@@ -1265,12 +1326,14 @@ function ItemEditor({
           </Field>
         </div>
         {kind === "product" && (
-          <PhotoField
+          <PhotoDrop
             tenantId={tenantId}
             item={item}
             storageEnabled={storageEnabled}
             inputId={`${uid}-photo`}
             disabled={busy !== null}
+            stagedFile={stagedPhoto}
+            onStage={setStagedPhoto}
             onPatched={onPatched}
             onToast={onToast}
           />
@@ -1323,12 +1386,14 @@ function ItemEditor({
  *  uploading needs an item id to attach the file to. So it PATCHes the row the moment a
  *  file is chosen and hands the fresh row up (onPatched) rather than waiting for Save,
  *  and the add-new-product editor renders it disabled until the row exists. */
-function PhotoField({
+function PhotoDrop({
   tenantId,
   item,
   storageEnabled,
   inputId,
   disabled,
+  stagedFile,
+  onStage,
   onPatched,
   onToast,
 }: {
@@ -1338,6 +1403,9 @@ function PhotoField({
   inputId: string;
   /** True while the surrounding form is saving or deleting. */
   disabled: boolean;
+  /** Add-mode only: the photo waiting for the row to exist (uploads on Save). */
+  stagedFile: File | null;
+  onStage: (file: File | null) => void;
   onPatched: (item: CatalogItem) => void;
   onToast: (kind: ToastItem["kind"], text: string) => void;
 }) {
@@ -1352,23 +1420,30 @@ function PhotoField({
     [],
   );
 
-  const photo = item?.image_url ?? null;
-  // Two reasons the picker can't work, each worth saying out loud: there's no row to
-  // attach a file to yet, or the server has no object storage — in which case every
-  // upload answers 503, so it's kinder to say so than to let 5 MB go up and fail.
-  const hint = !item
-    ? "Save the product first, then add a photo"
-    : !storageEnabled
-      ? "Photo uploads aren’t configured on this server"
-      : null;
-  const locked = !item || !storageEnabled || disabled || busy !== null;
+  // A dropped file previews via an object URL, revoked when replaced or unmounted —
+  // each staged file leaks a blob: URL otherwise.
+  const previewUrl = useMemo(
+    () => (stagedFile ? URL.createObjectURL(stagedFile) : null),
+    [stagedFile],
+  );
+  useEffect(
+    () => () => {
+      if (previewUrl) URL.revokeObjectURL(previewUrl);
+    },
+    [previewUrl],
+  );
 
-  async function onPick(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0];
-    // Cleared first, so re-picking the same file after a rejection still fires onChange.
-    e.target.value = "";
-    if (!file || !item || busy) return;
-    // Both limits mirror the backend, so a doomed upload never leaves the browser.
+  const photo = previewUrl ?? item?.image_url ?? null;
+  const staged = previewUrl !== null;
+  // Storage being off is the one hard lock — every upload would answer 503, so it's
+  // kinder to say so than to let 5 MB go up and fail. No row yet is NOT a lock any more:
+  // the file stages here and uploads right after Save creates the row.
+  const locked = !storageEnabled || disabled || busy !== null;
+
+  /** One gate for picker and drop alike — both limits mirror the backend, so a doomed
+   *  upload never leaves the browser. With a row, upload now; without one, stage. */
+  async function accept(file: File) {
+    if (busy) return;
     if (!IMAGE_TYPES.includes(file.type)) {
       onToast("error", "Photos must be a PNG, JPEG or WebP image");
       return;
@@ -1377,10 +1452,14 @@ function PhotoField({
       onToast("error", `Photos must be under ${IMAGE_MAX_MB} MB`);
       return;
     }
+    if (!item) {
+      onStage(file);
+      return;
+    }
     setBusy("upload");
     try {
       onPatched(await uploadCatalogImage(tenantId, item.id, file));
-      onToast("success", photo ? "Photo replaced" : "Photo added");
+      onToast("success", item.image_url ? "Photo replaced" : "Photo added");
     } catch (err) {
       onToast("error", errText(err, "Couldn’t upload the photo"));
     } finally {
@@ -1388,8 +1467,20 @@ function PhotoField({
     }
   }
 
+  function onPick(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    // Cleared first, so re-picking the same file after a rejection still fires onChange.
+    e.target.value = "";
+    if (file) void accept(file);
+  }
+
   async function onRemove() {
-    if (!item || busy) return;
+    if (busy) return;
+    if (staged) {
+      onStage(null); // nothing uploaded yet — no confirm ceremony for a local file
+      return;
+    }
+    if (!item) return;
     if (!confirmRemove) {
       setConfirmRemove(true);
       removeTimer.current = setTimeout(() => setConfirmRemove(false), CONFIRM_MS);
@@ -1408,70 +1499,150 @@ function PhotoField({
     }
   }
 
+  // dragenter/leave fire for every child crossed, so a bare boolean flickers; the depth
+  // counter nets them out and only depth 0 really means "left the zone".
+  const dragDepth = useRef(0);
+  const [dragOver, setDragOver] = useState(false);
+  const dragProps = locked
+    ? {}
+    : {
+        onDragEnter: (e: React.DragEvent<HTMLDivElement>) => {
+          e.preventDefault();
+          dragDepth.current += 1;
+          setDragOver(true);
+        },
+        // preventDefault here is what makes the browser allow a drop at all.
+        onDragOver: (e: React.DragEvent<HTMLDivElement>) => e.preventDefault(),
+        onDragLeave: () => {
+          dragDepth.current = Math.max(0, dragDepth.current - 1);
+          if (dragDepth.current === 0) setDragOver(false);
+        },
+        onDrop: (e: React.DragEvent<HTMLDivElement>) => {
+          e.preventDefault();
+          dragDepth.current = 0;
+          setDragOver(false);
+          const file = e.dataTransfer.files?.[0];
+          if (file) void accept(file);
+        },
+      };
+
   const openPicker = () => fileRef.current?.click();
+  // The empty zone is itself the button; with a photo, the overlay's Replace/Remove are
+  // the interactive elements instead (nesting them under a role="button" would be
+  // invalid), and clicking the image is a pointer convenience for Replace.
+  const zoneInteractive = !locked && !photo;
   return (
-    <Field label="Photo" htmlFor={inputId} help={hint ?? undefined}>
-      <div className="flex items-center gap-3">
-        {/* The tile is the big target; the button beside it is the same action spelled
-            out. Either opens the picker — same pairing as a card and its pencil. */}
-        <button
-          type="button"
-          onClick={openPicker}
-          disabled={locked}
-          aria-label={photo ? "Replace photo" : "Add photo"}
-          className={`relative grid h-[4.5rem] w-24 shrink-0 place-items-center overflow-hidden rounded-2xl transition-all duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring)] disabled:pointer-events-none disabled:opacity-55 ${
-            photo
-              ? "border border-[var(--color-border)] bg-[var(--color-bg-soft)]"
-              : "border border-dashed border-[var(--color-border-strong)] bg-[var(--color-surface)]/50 text-[var(--color-faint)] hover:border-[var(--color-accent)] hover:bg-[var(--accent-wash)] hover:text-[var(--color-accent-ink)]"
-          }`}
-        >
-          {photo ? (
-            /* Same reason as ItemCard: the photo host is env-dependent at runtime, so
-               next/image would need it pinned into next.config remotePatterns at build
-               time. The button's aria-label names it, so the alt stays empty. */
-            // eslint-disable-next-line @next/next/no-img-element
-            <img src={photo} alt="" className="h-full w-full object-cover" />
-          ) : (
-            <span className="flex flex-col items-center gap-1">
-              <ImageIcon className="h-5 w-5" />
-              <span className="text-[11px] font-semibold">Add photo</span>
-            </span>
-          )}
-          {busy && (
-            <span className="absolute inset-0 grid place-items-center bg-[var(--color-surface)]/75 text-[var(--color-muted)]">
-              <Spinner className="h-4 w-4" />
-            </span>
-          )}
-        </button>
-        <div className="flex flex-wrap items-center gap-2">
-          <Button
-            type="button"
-            variant="secondary"
-            size="sm"
-            onClick={openPicker}
-            disabled={locked}
-            loading={busy === "upload"}
-            icon={<UploadIcon className="h-3.5 w-3.5" />}
-          >
-            {photo ? "Replace" : "Upload"}
-          </Button>
-          {photo && (
-            <Button
-              type="button"
-              variant="danger"
-              size="sm"
-              onClick={onRemove}
-              disabled={disabled || busy === "upload"}
-              loading={busy === "remove"}
-              icon={<TrashIcon className="h-3.5 w-3.5" />}
+    <Field
+      label="Photo"
+      htmlFor={inputId}
+      help={!storageEnabled ? "Photo uploads aren’t configured on this server" : undefined}
+    >
+      <div
+        role={zoneInteractive ? "button" : undefined}
+        tabIndex={zoneInteractive ? 0 : undefined}
+        aria-label={zoneInteractive ? "Add photo — drag and drop, or browse" : undefined}
+        onClick={!locked ? openPicker : undefined}
+        onKeyDown={
+          zoneInteractive
+            ? (e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  openPicker();
+                }
+              }
+            : undefined
+        }
+        {...dragProps}
+        className={`group/drop relative h-40 w-full overflow-hidden rounded-2xl border transition-all duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring)] ${
+          dragOver
+            ? "scale-[1.01] border-[var(--color-accent)] bg-[var(--accent-wash)] shadow-[0_0_0_4px_var(--accent-wash)]"
+            : photo
+              ? "border-[var(--color-border)] bg-[var(--color-bg-soft)]"
+              : "border-dashed border-[var(--color-border-strong)] bg-[var(--color-surface)]/50 hover:border-[var(--color-accent)] hover:bg-[var(--accent-wash)]"
+        } ${locked ? "pointer-events-none opacity-55" : "cursor-pointer"}`}
+      >
+        {photo ? (
+          <>
+            {/* Same reason as ItemCard: the photo host is env-dependent at runtime, so
+                next/image would need it pinned into next.config remotePatterns at build
+                time. The zone's controls name the actions, so the alt stays empty. */}
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img
+              src={photo}
+              alt=""
+              className={`h-full w-full object-cover transition-transform duration-300 ${
+                dragOver ? "scale-105 blur-[2px]" : ""
+              }`}
+            />
+            {staged && (
+              <span className="absolute left-3 top-3">
+                <Badge tone="accent">
+                  <span className="normal-case tracking-normal">Uploads when you save</span>
+                </Badge>
+              </span>
+            )}
+            {dragOver ? (
+              <span className="absolute inset-0 grid place-items-center bg-[var(--color-surface)]/60 text-[13.5px] font-semibold text-[var(--color-accent-ink)]">
+                Drop to replace the photo
+              </span>
+            ) : (
+              /* Hover/focus-revealed on desktop, always present on touch widths — the
+                 same reveal contract as a card's pencil. */
+              <span
+                className="absolute inset-x-0 bottom-0 flex items-center justify-end gap-2 bg-gradient-to-t from-[rgb(0_0_0/0.45)] to-transparent p-3 opacity-100 transition-opacity duration-200 sm:opacity-0 sm:focus-within:opacity-100 sm:group-hover/drop:opacity-100"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="sm"
+                  onClick={openPicker}
+                  disabled={locked}
+                  icon={<UploadIcon className="h-3.5 w-3.5" />}
+                >
+                  Replace
+                </Button>
+                <Button
+                  type="button"
+                  variant="danger"
+                  size="sm"
+                  onClick={onRemove}
+                  disabled={disabled || busy === "upload"}
+                  loading={busy === "remove"}
+                  icon={<TrashIcon className="h-3.5 w-3.5" />}
+                >
+                  {staged ? "Remove" : confirmRemove ? "Really remove?" : "Remove"}
+                </Button>
+              </span>
+            )}
+          </>
+        ) : (
+          <span className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-1.5 text-[var(--color-faint)]">
+            <span
+              className={`grid h-11 w-11 place-items-center rounded-xl border border-[var(--color-border)] bg-[var(--color-surface)] text-[var(--color-muted)] transition-transform duration-200 ${
+                dragOver ? "scale-110 -rotate-3" : "group-hover/drop:scale-105"
+              }`}
             >
-              {confirmRemove ? "Really remove?" : "Remove"}
-            </Button>
-          )}
-        </div>
+              <ImageIcon className="h-5 w-5" />
+            </span>
+            <span className="mt-1 text-[13.5px] font-semibold text-[var(--color-muted)]">
+              {dragOver ? "Drop to add the photo" : "Drag & drop a photo"}
+            </span>
+            <span className="text-[12px]">
+              or click to browse · PNG, JPEG or WebP · up to {IMAGE_MAX_MB} MB
+            </span>
+          </span>
+        )}
+        {busy === "upload" && (
+          <span className="absolute inset-0 grid place-items-center bg-[var(--color-surface)]/75 text-[var(--color-muted)]">
+            <span className="flex items-center gap-2 text-[13px] font-semibold">
+              <Spinner className="h-4 w-4" /> Uploading…
+            </span>
+          </span>
+        )}
       </div>
       {/* sr-only rather than hidden so the "Photo" label above still opens the picker;
-          the two visible controls are the real affordances, hence tabIndex -1. */}
+          the zone is the real affordance, hence tabIndex -1. */}
       <input
         ref={fileRef}
         id={inputId}
@@ -1492,6 +1663,7 @@ function SnippetsSection({
   tenantId,
   kind,
   cache,
+  total,
   view,
   everExtracted,
   editingId,
@@ -1509,6 +1681,8 @@ function SnippetsSection({
   tenantId: string;
   kind: CatalogSnippetKind;
   cache: PageCache<CatalogSnippet>;
+  /** This tab's server-side total, for the "Showing N of M" footnote. */
+  total: number;
   view: PanelView;
   everExtracted: boolean;
   editingId: string | null;
@@ -1616,7 +1790,7 @@ function SnippetsSection({
           <SnippetCard key={snippet.id} snippet={snippet} onEdit={() => onEdit(snippet.id)} />
         ),
       )}
-      <PageSentinel cache={cache} kind={kind} sentinelRef={sentinelRef} onRetry={onRetry} />
+      <PageSentinel cache={cache} kind={kind} total={total} sentinelRef={sentinelRef} onRetry={onRetry} />
     </div>
   );
 }
@@ -1807,17 +1981,25 @@ function SnippetEditor({
 function PageSentinel({
   cache,
   kind,
+  total,
   sentinelRef,
   onRetry,
   className = "",
 }: {
   cache: PageCache<unknown>;
   kind: EntryKind;
+  /** Server-side count for this tab, so the footnote can say how far in the reader is. */
+  total: number;
   sentinelRef: (node: HTMLDivElement | null) => void;
   onRetry: () => void;
   className?: string;
 }) {
+  // Nothing more to fetch -> no sentinel at all, and no "end of list" message: once every
+  // row is on screen the tab badge's count is the whole truth, so a footnote saying the
+  // same thing twice is noise. The progress line only exists while the two numbers differ.
   if (cache.cursor === null) return null;
+  const shown = cache.rows.length;
+  const progress = total > shown ? `Showing ${shown} of ${total}` : null;
   return (
     <div
       ref={sentinelRef}
@@ -1833,12 +2015,13 @@ function PageSentinel({
         >
           Couldn’t load more — retry
         </Button>
-      ) : cache.loading ? (
-        <span className="flex items-center gap-2 text-[var(--color-faint)]">
-          <Spinner className="h-4 w-4" />
-          <span className="sr-only">Loading more {TAB_META[kind].plural}</span>
+      ) : (
+        <span className="flex items-center gap-2 text-[12.5px] tabular-nums text-[var(--color-faint)]">
+          {cache.loading && <Spinner className="h-4 w-4" />}
+          {cache.loading && <span className="sr-only">Loading more {TAB_META[kind].plural}</span>}
+          {progress}
         </span>
-      ) : null}
+      )}
     </div>
   );
 }

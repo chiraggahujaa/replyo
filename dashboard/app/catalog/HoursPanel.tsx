@@ -13,7 +13,13 @@ import {
   updateCatalogSettings,
 } from "@/lib/api";
 import { Button, Card, TextInput } from "../components/ui";
-import { CheckIcon, CopyIcon, RefreshIcon } from "../components/icons";
+import {
+  CheckIcon,
+  ChevronDownIcon,
+  ClockIcon,
+  CopyIcon,
+  RefreshIcon,
+} from "../components/icons";
 import { Field, StatusBadge, errText } from "./parts";
 
 // "0" is Monday, matching the backend's keying (Python's weekday(), not JS getDay()).
@@ -260,24 +266,20 @@ export function HoursPanel({
                     onChange={(open) => patchRow(d.key, { closed: !open })}
                   />
                   <div className="flex min-w-[13rem] flex-1 items-center gap-2">
-                    <TextInput
-                      type="time"
-                      aria-label={`${d.label} opening time`}
+                    <TimePicker
+                      ariaLabel={`${d.label} opening time`}
                       value={row.open}
                       disabled={row.closed || busy !== null}
-                      onChange={(e) => patchRow(d.key, { open: e.target.value })}
-                      className="min-w-0 flex-1 px-3 py-2 text-[13.5px]"
+                      onChange={(v) => patchRow(d.key, { open: v })}
                     />
                     <span aria-hidden className="text-[var(--color-faint)]">
                       –
                     </span>
-                    <TextInput
-                      type="time"
-                      aria-label={`${d.label} closing time`}
+                    <TimePicker
+                      ariaLabel={`${d.label} closing time`}
                       value={row.close}
                       disabled={row.closed || busy !== null}
-                      onChange={(e) => patchRow(d.key, { close: e.target.value })}
-                      className="min-w-0 flex-1 px-3 py-2 text-[13.5px]"
+                      onChange={(v) => patchRow(d.key, { close: v })}
                     />
                   </div>
                 </div>
@@ -402,6 +404,197 @@ export function HoursPanel({
           </Button>
         </div>
       </Card>
+    </div>
+  );
+}
+
+/* ---- TimePicker -------------------------------------------------------------------- */
+
+// The option grid the popover offers. 15 minutes covers real-world opening hours without
+// the list feeling endless (96 rows, auto-centered on the current value); an off-grid
+// value that arrived from extraction (say 09:10) is spliced in so it stays selectable.
+const TIME_STEP_MIN = 15;
+// Where the list centers when the field is still empty — mid-morning, not midnight.
+const DEFAULT_SCROLL_MIN = 9 * 60;
+
+function minutesToHHMM(m: number): string {
+  return `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
+}
+
+function minutesToLabel(m: number): string {
+  const h = Math.floor(m / 60);
+  const h12 = h % 12 === 0 ? 12 : h % 12;
+  return `${h12}:${String(m % 60).padStart(2, "0")} ${h < 12 ? "AM" : "PM"}`;
+}
+
+/** Field-shaped trigger + popover listbox, replacing the native time input whose OS
+ *  dropdown ignores the console's theme entirely. Value stays "HH:MM" (or "" for unset),
+ *  so validation and the PATCH payload are untouched. */
+function TimePicker({
+  value,
+  onChange,
+  disabled,
+  ariaLabel,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  disabled?: boolean;
+  ariaLabel: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const [dropUp, setDropUp] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+
+  const selected = toMinutes(value);
+  const options: number[] = [];
+  for (let m = 0; m < 24 * 60; m += TIME_STEP_MIN) options.push(m);
+  if (selected !== null && !options.includes(selected)) {
+    options.push(selected);
+    options.sort((a, b) => a - b);
+  }
+
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: PointerEvent) => {
+      if (!rootRef.current?.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener("pointerdown", onDown);
+    return () => document.removeEventListener("pointerdown", onDown);
+  }, [open]);
+
+  // On open: center the list on the current (or default) time, then move focus into it
+  // so the arrow keys pick up from there.
+  useEffect(() => {
+    if (!open) return;
+    const list = listRef.current;
+    const target = list?.querySelector<HTMLElement>("[data-anchor]") ?? undefined;
+    if (list && target) {
+      list.scrollTop = target.offsetTop - list.clientHeight / 2 + target.clientHeight / 2;
+      target.focus({ preventScroll: true });
+    }
+  }, [open]);
+
+  const openPicker = () => {
+    const r = triggerRef.current?.getBoundingClientRect();
+    // Flip upward only when the popover would clip the viewport bottom and there is
+    // more headroom above.
+    setDropUp(!!r && window.innerHeight - r.bottom < 300 && r.top > window.innerHeight - r.bottom);
+    setOpen(true);
+  };
+
+  const close = (refocus: boolean) => {
+    setOpen(false);
+    if (refocus) triggerRef.current?.focus();
+  };
+
+  const onListKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      close(true);
+      return;
+    }
+    if (e.key === "Tab") {
+      close(false);
+      return;
+    }
+    if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(e.key)) return;
+    e.preventDefault();
+    const items = Array.from(
+      listRef.current?.querySelectorAll<HTMLElement>('[role="option"]') ?? [],
+    );
+    if (!items.length) return;
+    const cur = items.indexOf(document.activeElement as HTMLElement);
+    const next =
+      e.key === "Home"
+        ? 0
+        : e.key === "End"
+          ? items.length - 1
+          : e.key === "ArrowDown"
+            ? Math.min(cur + 1, items.length - 1)
+            : Math.max(cur - 1, 0);
+    items[next]?.focus();
+  };
+
+  return (
+    <div ref={rootRef} className="relative min-w-0 flex-1">
+      <button
+        ref={triggerRef}
+        type="button"
+        disabled={disabled}
+        aria-label={ariaLabel}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        onClick={() => (open ? close(false) : openPicker())}
+        onKeyDown={(e) => {
+          if (!open && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
+            e.preventDefault();
+            openPicker();
+          }
+        }}
+        className={`flex w-full items-center gap-2 rounded-2xl border bg-[var(--color-surface)] px-3 py-2 text-left text-[13.5px] outline-none transition-all duration-200 focus-visible:border-[var(--color-accent)] focus-visible:ring-4 focus-visible:ring-[var(--ring)] disabled:cursor-not-allowed disabled:opacity-50 ${
+          open
+            ? "border-[var(--color-accent)] ring-4 ring-[var(--ring)]"
+            : "border-[var(--color-border-strong)] hover:border-[var(--color-accent)]"
+        }`}
+      >
+        <ClockIcon className="h-4 w-4 shrink-0 text-[var(--color-faint)]" />
+        <span
+          className={`flex-1 truncate tabular-nums ${
+            selected === null ? "text-[var(--color-faint)]" : "text-[var(--color-text)]"
+          }`}
+        >
+          {selected === null ? "Set time" : minutesToLabel(selected)}
+        </span>
+        <ChevronDownIcon
+          className={`h-4 w-4 shrink-0 text-[var(--color-faint)] transition-transform duration-200 ${
+            open ? "rotate-180" : ""
+          }`}
+        />
+      </button>
+
+      {open && (
+        <div
+          ref={listRef}
+          role="listbox"
+          aria-label={ariaLabel}
+          onKeyDown={onListKeyDown}
+          /* Opaque surface, same reason as Modal: `glass` lets the rows underneath
+             bleed through anything that overlays content. */
+          className={`animate-pop absolute left-0 right-0 z-30 max-h-[16rem] min-w-[10rem] overflow-y-auto rounded-2xl border border-[var(--color-border)] bg-[var(--color-surface)] p-1.5 shadow-2xl ${
+            dropUp ? "bottom-full mb-2" : "top-full mt-2"
+          }`}
+        >
+          {options.map((m) => {
+            const isSel = selected !== null && m === selected;
+            // Scroll/focus anchor: the selected row, or mid-morning when still unset.
+            const isAnchor = isSel || (selected === null && m === DEFAULT_SCROLL_MIN);
+            return (
+              <button
+                key={m}
+                type="button"
+                role="option"
+                aria-selected={isSel}
+                data-anchor={isAnchor || undefined}
+                tabIndex={-1}
+                onClick={() => {
+                  onChange(minutesToHHMM(m));
+                  close(true);
+                }}
+                className={`flex w-full items-center justify-between rounded-xl px-3 py-1.5 text-left text-[13.5px] tabular-nums transition-colors duration-150 outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--ring)] ${
+                  isSel
+                    ? "bg-[var(--accent-wash)] font-semibold text-[var(--color-accent-ink)]"
+                    : "text-[var(--color-text)] hover:bg-[var(--color-bg-soft)]"
+                }`}
+              >
+                {minutesToLabel(m)}
+                {isSel && <CheckIcon className="h-3.5 w-3.5 shrink-0" />}
+              </button>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }

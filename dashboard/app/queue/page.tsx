@@ -7,7 +7,7 @@ import { Shell } from "../components/Shell";
 import { useReplyo } from "../providers";
 import { ReviewList } from "../components/ReviewList";
 import { ReviewDetail } from "../components/ReviewDetail";
-import { Badge, Button, EmptyState, SkeletonCard, ToastShelf, type ToastItem } from "../components/ui";
+import { Badge, Button, EmptyState, SkeletonCard, Spinner, ToastShelf, type ToastItem } from "../components/ui";
 import { InboxIcon, PlusIcon, RocketIcon } from "../components/icons";
 
 // Fallback cadence when the websocket is down; while it's up, changes push instantly.
@@ -24,8 +24,18 @@ export default function QueuePage() {
 // Remount the queue on persona switch so its state (loading, list, selection) resets
 // cleanly without a reset effect.
 function QueueForActive() {
-  const { active } = useReplyo();
-  if (!active) return <NoPersona />;
+  const { active, personasLoading } = useReplyo();
+  if (!active) {
+    if (personasLoading) {
+    return (
+      <div className="flex flex-1 flex-col items-center justify-center py-24 text-[var(--color-faint)]">
+        <Spinner className="h-5 w-5" />
+        <span className="sr-only">Loading personas</span>
+      </div>
+    );
+    }
+    return <NoPersona />;
+  }
   return <Queue key={active.id} active={active} />;
 }
 

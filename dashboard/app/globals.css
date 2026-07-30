@@ -118,6 +118,18 @@ body {
   transition: color 0.35s ease;
 }
 
+/* Tailwind v4's preflight leaves buttons on the browser's default arrow cursor. Every
+   enabled clickable here should read as clickable — one rule, site-wide, instead of
+   sprinkling cursor-pointer per component (which is how the tabs and half the buttons
+   ended up without it). Disabled state opts back out, whichever way it's expressed. */
+:is(button, [role="button"], [role="tab"], select, summary, label[for], a[href]) {
+  cursor: pointer;
+}
+:is(button, select):disabled,
+[aria-disabled="true"] {
+  cursor: not-allowed;
+}
+
 .font-display {
   font-family: var(--font-display), var(--font-sans), ui-sans-serif, system-ui, sans-serif;
 }

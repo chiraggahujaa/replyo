@@ -106,7 +106,7 @@ function Sidebar() {
 }
 
 function PersonaSwitcher() {
-  const { personas, active, setActiveId } = useReplyo();
+  const { personas, active, personasLoading, setActiveId } = useReplyo();
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
 
@@ -128,7 +128,12 @@ function PersonaSwitcher() {
         aria-expanded={open}
         className="w-full flex items-center justify-between gap-2 rounded-2xl border border-[var(--color-border)] bg-[var(--color-surface)] px-4 py-2.5 text-left transition-all duration-200 hover:border-[var(--color-border-strong)] hover:bg-[var(--color-surface-2)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring)]"
       >
-        <span className="truncate text-[14px] font-semibold">{active ? active.name : "No personas yet"}</span>
+        <span className="truncate text-[14px] font-semibold">
+          {/* While the first fetch is still out and nothing is cached, the truthful label
+              is "loading" — "No personas yet" here would tell a returning user their
+              personas are gone for as long as the request takes. */}
+          {active ? active.name : personasLoading ? "Loading personas…" : "No personas yet"}
+        </span>
         <ChevronDownIcon
           className={`h-4 w-4 shrink-0 text-[var(--color-faint)] transition-transform duration-200 ${
             open ? "rotate-180" : ""

@@ -31,8 +31,18 @@ import jwt
 import psycopg
 from fastapi import Header, HTTPException
 from psycopg.rows import DictRow, dict_row
+from psycopg.types.numeric import FloatLoader
 
 from app.config import settings
+
+# Postgres `numeric` comes back as decimal.Decimal by default, and FastAPI routes
+# annotated `-> dict` hand their payload to pydantic v2, which serializes Decimal as a
+# JSON *string* ("500", not 500). The console's types say number, so every numeric
+# column — price_amount was the first casualty, rendering as "No price" — would need
+# per-endpoint patching. Registering the float loader on psycopg's global adapter map
+# fixes the contract once, at the layer that owns it: our numerics are display values
+# (prices), where float precision is ample; storage stays exact `numeric` in Postgres.
+psycopg.adapters.register_loader("numeric", FloatLoader)
 
 logger = logging.getLogger("replyo.tenancy")
 
