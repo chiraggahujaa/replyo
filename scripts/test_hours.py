@@ -48,42 +48,62 @@ def test_merge_hours():
     print("\n\033[1m1) _merge_hours — first batch wins per weekday\033[0m")
 
     hours, slot = _merged(
-        _batch([{"weekday": 0, "open": "09:30", "close": "20:00"}]),
-        _batch([{"weekday": 0, "open": "11:00", "close": "12:00"},
-                {"weekday": 1, "open": "10:00", "close": "18:00"}]),
+        _batch([{"day": "monday", "open": "09:30", "close": "20:00"}]),
+        _batch([{"day": "monday", "open": "11:00", "close": "12:00"},
+                {"day": "tuesday", "open": "10:00", "close": "18:00"}]),
     )
     check("first batch owns the weekday it claimed",
           hours == {"0": {"open": "09:30", "close": "20:00"},
                     "1": {"open": "10:00", "close": "18:00"}}, str(hours))
     check("slot stays None when no batch states one", slot is None, str(slot))
 
-    hours, _ = _merged(_batch([{"weekday": 6, "closed": True}]))
+    hours, _ = _merged(_batch([{"day": "sunday", "closed": True}]))
     check("closed=true is recorded as closed (null)", hours == {"6": None}, str(hours))
 
     # A closure still CLAIMS the day: a later page saying "Sunday 10-14" must not reopen it.
     hours, _ = _merged(
-        _batch([{"weekday": 6, "closed": True}]),
-        _batch([{"weekday": 6, "open": "10:00", "close": "14:00"}]),
+        _batch([{"day": "sunday", "closed": True}]),
+        _batch([{"day": "sunday", "open": "10:00", "close": "14:00"}]),
     )
     check("a claimed closure is not reopened by a later batch", hours == {"6": None}, str(hours))
 
     # Neither closed nor a complete window -> ignored, and does NOT claim the day, so a
     # good entry later still fills it.
     hours, _ = _merged(
-        _batch([{"weekday": 2, "open": "09:00"}, {"weekday": 3}]),
-        _batch([{"weekday": 2, "open": "09:00", "close": "17:00"}]),
+        _batch([{"day": "wednesday", "open": "09:00"}, {"day": "thursday"}]),
+        _batch([{"day": "wednesday", "open": "09:00", "close": "17:00"}]),
     )
     check("half-stated entry is dropped and leaves the day unclaimed",
           hours == {"2": {"open": "09:00", "close": "17:00"}}, str(hours))
 
     hours, _ = _merged(_batch([
-        {"weekday": 0, "open": "25:00", "close": "26:00"},   # not a real clock time
-        {"weekday": 1, "open": "9:5", "close": "17:00"},     # not zero-padded "HH:MM"
-        {"weekday": 2, "open": "abc", "close": "17:00"},     # not a time at all
-        {"weekday": 3, "open": "17:00", "close": "09:00"},   # closes before it opens
-        {"weekday": 9, "open": "09:00", "close": "17:00"},   # not a weekday
+        {"day": "monday", "open": "25:00", "close": "26:00"},    # not a real clock time
+        {"day": "tuesday", "open": "9:5", "close": "17:00"},     # not zero-padded "HH:MM"
+        {"day": "wednesday", "open": "abc", "close": "17:00"},   # not a time at all
+        {"day": "thursday", "open": "17:00", "close": "09:00"},  # closes before it opens
     ]))
-    check("every invalid time/weekday is dropped -> nothing stated", hours is None, str(hours))
+    check("every invalid time is dropped -> nothing stated", hours is None, str(hours))
+
+    # The day is a NAME, so an unknown/garbage day can't reach the merge at all — pydantic
+    # rejects it. This is the guard against the Sunday=0 confusion that once filed Sunday's
+    # 10-6 window under Monday (see ExtractedHours' docstring).
+    for bad in ("0", "Mon", "sun", "funday", ""):
+        try:
+            ExtractedHours(day=bad, open="09:00", close="17:00")  # type: ignore[arg-type]
+            ok = False
+        except Exception:
+            ok = True
+        check(f"day={bad!r} is rejected by the schema", ok)
+
+    # Every real name maps to the Python weekday index business_profiles.hours is keyed by
+    # (Monday=0 ... Sunday=6) — the mapping the model no longer has to get right.
+    hours, _ = _merged(_batch([
+        {"day": "monday", "open": "09:00", "close": "20:00"},
+        {"day": "sunday", "open": "10:00", "close": "18:00"},
+    ]))
+    check("names map to Mon=0 / Sun=6, not the Sunday=0 convention",
+          hours == {"0": {"open": "09:00", "close": "20:00"},
+                    "6": {"open": "10:00", "close": "18:00"}}, str(hours))
 
     _, slot = _merged(_batch(slot=45), _batch(slot=60))
     check("slot_minutes: first stated value wins", slot == 45, str(slot))

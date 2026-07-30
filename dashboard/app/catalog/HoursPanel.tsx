@@ -6,14 +6,14 @@
 // carries only the fields its own section owns, so correcting Tuesday's closing time
 // never re-stamps the appointment grid as human-edited (and vice versa).
 
-import { useId, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import {
   type BusinessHours,
   type CatalogSettings,
   updateCatalogSettings,
 } from "@/lib/api";
 import { Button, Card, TextInput } from "../components/ui";
-import { CheckIcon, CopyIcon } from "../components/icons";
+import { CheckIcon, CopyIcon, RefreshIcon } from "../components/icons";
 import { Field, StatusBadge, errText } from "./parts";
 
 // "0" is Monday, matching the backend's keying (Python's weekday(), not JS getDay()).
@@ -37,6 +37,9 @@ const SLOT_MIN = 5;
 const SLOT_MAX = 240;
 const BUFFER_MIN = 0;
 const BUFFER_MAX = 60;
+// Matches the catalog page's two-click confirm window, so destructive-ish actions feel
+// the same everywhere in the console.
+const CONFIRM_MS = 3200;
 
 type Row = { closed: boolean; open: string; close: string };
 type Rows = Record<string, Row>;
@@ -104,6 +107,14 @@ export function HoursPanel({
   const [hoursErr, setHoursErr] = useState<string | null>(null);
   const [settingsErr, setSettingsErr] = useState<string | null>(null);
   const [strictRows, setStrictRows] = useState(false);
+  const [confirmReset, setConfirmReset] = useState(false);
+  const resetTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(
+    () => () => {
+      if (resetTimer.current) clearTimeout(resetTimer.current);
+    },
+    [],
+  );
 
   const patchRow = (key: string, p: Partial<Row>) =>
     setRows((r) => ({ ...r, [key]: { ...r[key], ...p } }));
@@ -139,6 +150,33 @@ export function HoursPanel({
       onToast("success", "Opening hours saved");
     } catch (e) {
       onToast("error", errText(e, "Couldn't save opening hours"));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  // Hand the hours back to extraction. `hours: null` clears hours_status, so the next
+  // run refills them from the documents — the way out of a stray save (accepting the
+  // blank all-closed week the panel seeds) having pinned this persona to empty hours.
+  async function resetHours() {
+    if (busy) return;
+    if (!confirmReset) {
+      setConfirmReset(true);
+      resetTimer.current = setTimeout(() => setConfirmReset(false), CONFIRM_MS);
+      return;
+    }
+    if (resetTimer.current) clearTimeout(resetTimer.current);
+    setConfirmReset(false);
+    setBusy("hours");
+    setHoursErr(null);
+    try {
+      const saved = await updateCatalogSettings(tenantId, { hours: null });
+      setRows(seedRows(saved.hours));
+      setStrictRows(false);
+      onSaved(saved);
+      onToast("success", "Hours handed back to Replyo — run “Re-extract from knowledge” to fill them in");
+    } catch (e) {
+      onToast("error", errText(e, "Couldn’t reset opening hours"));
     } finally {
       setBusy(null);
     }
@@ -188,9 +226,11 @@ export function HoursPanel({
           <div className="min-w-0">
             <h3 className="font-display text-[16px] font-semibold tracking-tight">Opening hours</h3>
             <p className="mt-1 text-[13px] text-[var(--color-faint)]">
-              {neverExtracted
-                ? "We didn’t find opening hours in your documents — set them here."
-                : "The days and times the assistant tells customers you’re open."}
+              {settings?.hours_status === "edited"
+                ? "These are your own hours — re-extracting won’t overwrite them. Reset to auto to read them from your documents again."
+                : neverExtracted
+                  ? "We didn’t find opening hours in your documents — set them here, or re-extract if you’ve just added them."
+                  : "The days and times the assistant tells customers you’re open."}
             </p>
           </div>
           {settings && <StatusBadge status={settings.hours_status} />}
@@ -276,6 +316,20 @@ export function HoursPanel({
           >
             Copy Monday to all weekdays
           </Button>
+          {/* Only meaningful once the owner has claimed the hours — until then extraction
+              already owns them and there is nothing to hand back. */}
+          {settings?.hours_status === "edited" && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={resetHours}
+              disabled={busy !== null}
+              title="Let Replyo read opening hours from your documents again"
+              icon={<RefreshIcon className="h-3.5 w-3.5" />}
+            >
+              {confirmReset ? "Discard these hours?" : "Reset to auto"}
+            </Button>
+          )}
         </div>
       </Card>
 

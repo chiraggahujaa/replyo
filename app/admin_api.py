@@ -432,6 +432,12 @@ async def update_business_settings(
     only the half the owner hasn't claimed (app/extraction.py _finish). The row is
     upserted because a persona that has never run an extraction has no profile row yet —
     editing hours must not require extracting first.
+
+    `hours: null` is the way BACK: it clears the owner's claim (hours_status='extracted')
+    so the next extraction repopulates them from the documents. Without this, one stray
+    save — e.g. accepting the all-closed blank week the panel seeds when nothing was
+    extracted yet — would silently disable hours extraction for that persona forever,
+    with no route back through the console.
     """
     fields = body.model_dump(exclude_unset=True)
     if not fields:
@@ -439,8 +445,11 @@ async def update_business_settings(
     sets: list[str] = []
     params: dict[str, object] = {"tenant_id": str(tenant["id"])}
     if "hours" in fields:
-        sets.append("hours = %(hours)s, hours_status = 'edited'")
-        params["hours"] = Jsonb(fields["hours"]) if fields["hours"] is not None else None
+        if fields["hours"] is None:
+            sets.append("hours = null, hours_status = 'extracted'")
+        else:
+            sets.append("hours = %(hours)s, hours_status = 'edited'")
+            params["hours"] = Jsonb(fields["hours"])
     for col in ("slot_minutes", "buffer_minutes"):
         if col in fields and fields[col] is not None:
             sets.append(f"{col} = %({col})s")

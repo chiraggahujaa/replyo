@@ -71,6 +71,19 @@ STALE_RUN_MINUTES = 15
 # shouldn't be able to produce a 480-minute grid (one slot a day) or a 1-minute one.
 MIN_SLOT_MINUTES, MAX_SLOT_MINUTES = 5, 240
 
+# Weekday name -> Python weekday() index, the keying business_profiles.hours uses.
+# The model answers with names precisely so this mapping happens here and not in its head
+# (see ExtractedHours for what went wrong when it didn't).
+WEEKDAY_INDEX = {
+    "monday": 0,
+    "tuesday": 1,
+    "wednesday": 2,
+    "thursday": 3,
+    "friday": 4,
+    "saturday": 5,
+    "sunday": 6,
+}
+
 EXTRACTION_PROMPT = """You extract structured business facts from a chunk of a business's \
 documents or website text.
 
@@ -94,9 +107,9 @@ the text states no price.
 
 Rules for opening hours (the `hours` list) — one entry per weekday, and ONLY when the text \
 explicitly states hours. Never guess or infer a weekday the text doesn't mention:
-- weekday is 0=Monday, 1=Tuesday, ... 6=Sunday.
+- day is the lowercase weekday name: "monday", "tuesday", ... "sunday".
 - Expand stated ranges into one entry per day: "Mon-Sat 9:30am-8pm" becomes six entries \
-(weekday 0,1,2,3,4,5), each open "09:30" and close "20:00".
+("monday" through "saturday"), each open "09:30" and close "20:00".
 - open/close are 24-hour "HH:MM" ("9am" -> "09:00", "8pm" -> "20:00", "noon" -> "12:00").
 - A day the text says is closed gets closed=true with open and close null.
 - Return an empty list when the text states no hours at all.
@@ -140,9 +153,18 @@ class ExtractedHours(BaseModel):
     `closed` and open/close are mutually exclusive in practice: a stated closure sets
     closed=true and leaves the times null; a stated window sets both times. An entry
     that is neither is meaningless and gets dropped in _merge_hours.
+
+    The day is a NAME, not an index. Asking for "0=Monday..6=Sunday" looks tidier but
+    silently corrupts data: models routinely answer with the other common convention
+    (Sunday=0), so a page saying "Mon-Fri 9-8, Sun 10-6" could come back with Sunday's
+    window filed under Monday — indistinguishable from a real Monday statement, and
+    first-wins merging then locks the wrong hours in. Same split as app/booking.py:
+    the model does language, Python does the index arithmetic (WEEKDAY_INDEX).
     """
 
-    weekday: int = Field(description="0=Monday, 1=Tuesday, ... 6=Sunday.")
+    day: Literal[
+        "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"
+    ] = Field(description="Lowercase weekday name, e.g. \"monday\".")
     closed: bool = Field(False, description="True when the text says the business is closed that day.")
     open: str | None = Field(None, description='Opening time, 24-hour "HH:MM" (e.g. "09:30").')
     close: str | None = Field(None, description='Closing time, 24-hour "HH:MM" (e.g. "20:00").')
@@ -313,9 +335,9 @@ def _merge_hours(
 
     for batch, _source in batches:
         for entry in batch.hours:
-            if not 0 <= entry.weekday <= 6:
-                continue
-            key = str(entry.weekday)
+            # Name -> Python weekday index here, where it can't be misread (see
+            # ExtractedHours). Literal-typed, so an unknown name can't reach this.
+            key = str(WEEKDAY_INDEX[entry.day])
             if key in hours:
                 continue
             if entry.closed:
